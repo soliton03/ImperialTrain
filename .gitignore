@@ -1,0 +1,22 @@
+# STM32CubeIDE
+.metadata/
+*.launch
+
+# Build outputs
+Debug/
+Release/
+*.o
+*.a
+*.d
+*.elf
+*.map
+*.list
+*.bin
+*.hex
+*.srec
+
+# OS/Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

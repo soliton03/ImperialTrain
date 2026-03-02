@@ -1,0 +1,1373 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : Main program body
+  ******************************************************************************
+  * @attention
+  *
+  * Copyright (c) 2026 STMicroelectronics.
+  * All rights reserved.
+  *
+  * This software is licensed under terms that can be found in the LICENSE file
+  * in the root directory of this software component.
+  * If no LICENSE file comes with this software, it is provided AS-IS.
+  *
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+/* Includes ------------------------------------------------------------------*/
+#include "main.h"
+
+/* Private includes ----------------------------------------------------------*/
+/* USER CODE BEGIN Includes */
+#include <stdint.h>
+#include <stddef.h>
+#include <stdbool.h>
+#include <string.h>
+#include <stdlib.h>
+#include <unistd.h>
+/* USER CODE END Includes */
+
+/* Private typedef -----------------------------------------------------------*/
+/* USER CODE BEGIN PTD */
+
+/* USER CODE END PTD */
+
+/* Private define ------------------------------------------------------------*/
+/* USER CODE BEGIN PD */
+
+/* USER CODE END PD */
+
+/* Private macro -------------------------------------------------------------*/
+/* USER CODE BEGIN PM */
+#define CMD_DEBUG
+/* USER CODE END PM */
+
+/* Private variables ---------------------------------------------------------*/
+ADC_HandleTypeDef hadc1;
+
+SPI_HandleTypeDef hspi1;
+
+TIM_HandleTypeDef htim14;
+
+UART_HandleTypeDef huart1;
+UART_HandleTypeDef huart2;
+DMA_HandleTypeDef hdma_usart1_tx;
+
+/* USER CODE BEGIN PV */
+/* ====== 移植：定数（Arduino相当） ====== */
+#define TIMER_INTERVAL   1    // ms
+#define PW_MIN           16
+#define PW_CHK           48
+#define PW_LONG          72
+#define PW_BELL_MIN      128
+#define PW_BELL_MAX      256
+#define PW_WHISTLE       264
+#define CBITLEN          11
+
+#define CMD_WHISTLE_ON   0xF001
+#define CMD_WHISTLE_OFF  0xF000
+#define CMD_BELL         0xF002
+
+typedef enum {
+  QS_IDLE  = 0,
+  QS_SET   = 1,
+  QS_RESET = 2
+} QaState;
+
+/* ====== GPIO ヘルパ（VP_PIN→VPIN, VM_PIN→VMIN, 4/5→IO0/IO1） ======
+ *  ※ 以下のマクロは CubeMX が自動生成する main.h 由来のものを利用します。
+ *    VPIN_GPIO_Port / VPIN_Pin
+ *    VMIN_GPIO_Port / VMIN_Pin
+ *    IO0_GPIO_Port  / IO0_Pin   // 旧 Arduino pin 4
+ *    IO1_GPIO_Port  / IO1_Pin   // 旧 Arduino pin 5
+ */
+static inline int digitalRead_VP(void){
+  return HAL_GPIO_ReadPin(VPIN_GPIO_Port, VPIN_Pin) ? 1 : 0;
+}
+static inline int digitalRead_VM(void){
+  return HAL_GPIO_ReadPin(VMIN_GPIO_Port, VMIN_Pin) ? 1 : 0;
+}
+static inline void digitalWrite_IO0(int level){
+  HAL_GPIO_WritePin(IO0_GPIO_Port, IO0_Pin, level ? GPIO_PIN_SET : GPIO_PIN_RESET);
+}
+static inline void digitalWrite_IO1(int level){
+  HAL_GPIO_WritePin(IO1_GPIO_Port, IO1_Pin, level ? GPIO_PIN_SET : GPIO_PIN_RESET);
+}
+
+static inline void digitalWrite_IO2(int level){
+  HAL_GPIO_WritePin(IO2_GPIO_Port, IO2_Pin, level ? GPIO_PIN_SET : GPIO_PIN_RESET);
+}
+/* ====== コマンドキュー（ISR安全な最小リングバッファ） ====== */
+#define CMDQ_SIZE 16
+static volatile int      cmdq[CMDQ_SIZE];
+static volatile uint8_t  q_head = 0, q_tail = 0;
+static inline bool cmdq_is_empty(void){ return q_head == q_tail; }
+static inline void cmdq_push_isr(int v){
+  uint8_t nh = (uint8_t)(q_head + 1);
+  if (nh != q_tail) { cmdq[q_head] = v; q_head = nh; } // フル時は捨てる
+}
+static inline int cmdq_pop(void){
+  if (cmdq_is_empty()) return -1;
+  int v = cmdq[q_tail]; q_tail = (uint8_t)(q_tail + 1); return v;
+}
+
+/* ====== 変数（Arduinoスケッチ由来） ====== */
+static volatile uint8_t  lVP = 0, lVM = 0; // 直近サンプル
+static volatile uint8_t  VP  = 0, VM  = 0; // ノイズキャンセル後
+static volatile int      LastState   = QS_IDLE;
+static volatile uint16_t PulseWidth  = 0;
+static volatile bool     CmdMode     = false;
+static volatile bool     IsWhistle   = false;
+static volatile uint16_t cCmd        = 0;
+static volatile uint8_t  cbitCnt     = 0;
+static volatile uint8_t  nextBitLen  = CBITLEN;
+
+/* ====== プロトタイプ ====== */
+static void QA_Init(void);
+static void QA_1msTick(void);
+static void QA_Task(void);
+
+/* USER CODE END PV */
+
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_DMA_Init(void);
+static void MX_ADC1_Init(void);
+static void MX_SPI1_Init(void);
+static void MX_USART1_UART_Init(void);
+static void MX_USART2_UART_Init(void);
+static void MX_TIM14_Init(void);
+/* USER CODE BEGIN PFP */
+
+/* USER CODE END PFP */
+
+/* Private user code ---------------------------------------------------------*/
+/* USER CODE BEGIN 0 */
+//=========================================================================
+// COMMAND Helper for DEBUG
+//=========================================================================
+const char *LastCmd=NULL;
+
+#ifdef CMD_DEBUG
+const char *cmdName[42]={
+  //00-GROUPE
+  "9","12","6","StatusReport","MUTE","MUTE*","3","ReLeaseBrakes","ApplyBrakes",
+  //01-GROUPE
+	"VolumeUp",	"VolumeDwon","15","15*","4","4*","5","5*",
+	"10","10*","11","11*","7","7*","2","2*",
+	"8","8*","13","13*","14","14*","1","1*",
+  //10-GROUPE
+  "STC","RTC","DisconnectStandby","StartUp","StartUp*","Shutdown","Shutdown*",
+  //Addtional GROUPE(Whistle OFFは非表示)
+  "Whistle","BELL"
+};
+
+const uint16_t cmdCode[42]={
+  //00-GROUPE
+  0x000,0x005,0x009,0x014,0x018,0x01b,0x02d,0x035,0x30,
+  //01-GROUPE
+  0x041,0x044,0x048,0x04b,0x04d,0x04e,0x050,0x053,0x055,
+  0x056,0x059,0x05a,0x060,0x063,0x069,0x06a,0x06c,0x06f,
+  0x074,0x077,0x071,0x072,0x078,0x07b,
+  //10-GROUPE
+  0x09a,0x099,0x0a0,0x0a5,0x0a7,0x0a9,0x0aa,
+  //Addtional GROUPE(Whistle OFFは非表示)
+  0xF001,0xF002
+};
+
+int GetCmdNo(uint16_t cmd){
+  int i;
+  for(i=0;i<42;i++){
+    if(cmdCode[i]==cmd){
+      return i;
+    }
+  }
+  return -1;
+}
+#endif
+
+/* 1msごとに呼ばれるコールバック */
+#define RX_BUF_SIZE 128
+static uint8_t rx_buf[RX_BUF_SIZE];
+static volatile uint16_t rx_head = 0;
+static volatile uint16_t rx_tail = 0;
+
+volatile unsigned int MS_COUNT=0;
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+  if (htim->Instance == TIM14)
+  {
+	  QA_1msTick();
+	  if(MS_COUNT>0){
+		  MS_COUNT--;   // 任意の処理（フラグやソフトタイマ更新など）
+	  }
+  }
+}
+
+void delay_ms(unsigned int ms){
+	MS_COUNT=ms;
+	while(MS_COUNT);
+}
+
+//====================================================================
+// SOUND 関連
+//====================================================================
+// 公開API
+HAL_StatusTypeDef SoundInit(void);                 // 初期化（BTL直結/Class-D前提）
+// Forward declaration（先に宣言して暗黙宣言を防止）
+static HAL_StatusTypeDef SOUND_Rd1(uint8_t cmd, uint8_t *out, uint32_t to_ms);
+
+// ==== CS制御 ====
+static inline void SOUND_CS_L(void){ HAL_GPIO_WritePin(NCS_GPIO_Port, NCS_Pin, GPIO_PIN_RESET); }
+static inline void SOUND_CS_H(void){ HAL_GPIO_WritePin(NCS_GPIO_Port, NCS_Pin, GPIO_PIN_SET); }
+
+// ==== 設定マクロ ====
+// SPIタイムアウト
+#ifndef SOUND_SPI_TIMEOUT_MS
+#define SOUND_SPI_TIMEOUT_MS   50u
+#endif
+// 出力方式（BTL直結するのでClass-D）
+#ifndef SOUND_USE_CLASS_D
+#define SOUND_USE_CLASS_D      1   // 1:Class-D(BTL), 0:Class-AB(単端)
+#endif
+
+// ==== CBUSYB=H 待ち ====
+static HAL_StatusTypeDef SOUND_WaitReady(uint32_t timeout_ms)
+{
+    uint32_t start = HAL_GetTick();
+    while (HAL_GPIO_ReadPin(CBUSY_GPIO_Port, CBUSY_Pin) != GPIO_PIN_SET) {
+        if ((HAL_GetTick() - start) >= timeout_ms) return HAL_TIMEOUT;
+    }
+    return HAL_OK;
+}
+
+// ==== SPI送信（CBUSYB監視つき）====
+static HAL_StatusTypeDef SOUND_Tx(const uint8_t *buf, uint16_t len, uint32_t timeout_ms)
+{
+    HAL_StatusTypeDef st = SOUND_WaitReady(timeout_ms);
+    if (st != HAL_OK) return st;
+
+    SOUND_CS_L();
+    st = HAL_SPI_Transmit(&hspi1, (uint8_t*)buf, len, timeout_ms);
+    SOUND_CS_H();
+    return st;
+}
+
+// ==== コマンド低層 ====
+
+// PUP（1B, WCM=0）: パワーダウン解除
+static HAL_StatusTypeDef SOUND_SendPUP(uint32_t to_ms)
+{
+    const uint8_t b = 0x00; // 0000 0000b
+    return SOUND_Tx(&b, 1, to_ms);
+}
+
+// AMODE（2B）: 0000 01 DAMP HPF / FAD DAG1 DAG0 AIG1 AIG0 AEN1 AEN0 POP
+static HAL_StatusTypeDef SOUND_SendAMODE(
+    uint8_t DAMP, uint8_t HPF,
+    uint8_t FAD,  uint8_t DAG,      // 0..3
+    uint8_t AIG,                     // 0..2
+    uint8_t AEN1, uint8_t AEN0,
+    uint8_t POP,
+    uint32_t to_ms)
+{
+    uint8_t b1 = (uint8_t)(0x04 | ((DAMP & 1) << 1) | (HPF & 1));
+    uint8_t b2 = (uint8_t)((FAD & 1) << 7 | (DAG & 3) << 5 | (AIG & 3) << 3 |
+                           (AEN1 & 1) << 2 | (AEN0 & 1) << 1 | (POP & 1));
+    const uint8_t tx[2] = { b1, b2 };
+    return SOUND_Tx(tx, 2, to_ms);
+}
+
+// AVOL（2B）: 0x08, code（例: 0x24=0 dB）
+static HAL_StatusTypeDef SOUND_SendAVOL(uint8_t av_code, uint32_t to_ms)
+{
+    const uint8_t tx[2] = { 0x08, av_code };
+    return SOUND_Tx(tx, 2, to_ms);
+}
+
+// CVOL（2B）: 1010 CH3 CH2 CH1 CH0, 0 CV1 CV0 CV6 CV5 CV4 CV3 CV2
+static HAL_StatusTypeDef SOUND_SendCVOL(uint8_t ch, uint8_t vol7, uint32_t to_ms)
+{
+    if (ch > 3) return HAL_ERROR;
+    const uint8_t b1 = (uint8_t)(0xA0 | (1u << (ch & 0x03)));
+    const uint8_t b2 = (uint8_t)(vol7 & 0x7F);  // 7bit
+    const uint8_t tx[2] = { b1, b2 };
+    return SOUND_Tx(tx, 2, to_ms);
+}
+
+// PLAY（2B）: [0100 F9 F8 C1 C0], [F7..F0]（0..1023）
+static HAL_StatusTypeDef SOUND_SendPLAY(uint8_t ch, uint16_t phrase, uint32_t to_ms)
+{
+    if (ch > 3) return HAL_ERROR;
+    phrase &= 0x03FF; // F9..F0
+
+    uint8_t b1 = 0x40;                              // 0100 xxxx
+    b1 |= (uint8_t)(((phrase >> 8) & 0x03) << 2);   // F9,F8 → bit3:2
+    b1 |= (uint8_t)(ch & 0x03);                     // C1,C0 → bit1:0
+    const uint8_t b2 = (uint8_t)(phrase & 0xFF);
+
+    const uint8_t tx[2] = { b1, b2 };
+    return SOUND_Tx(tx, 2, to_ms);
+}
+
+// STOP（1B）: [0110 CH3 CH2 CH1 CH0]
+static HAL_StatusTypeDef SOUND_SendSTOP(uint8_t ch, uint32_t to_ms)
+{
+    if (ch > 3) return HAL_ERROR;
+    const uint8_t b1 = (uint8_t)(0x60 | (1u << (ch & 0x03)));
+    return SOUND_Tx(&b1, 1, to_ms);
+}
+
+// ==== 公開API ====
+
+// 初期化：PUP → AMODE(Class-D/BTL) → AVOL(0dB) → CVOL(全CH=0dB)
+HAL_StatusTypeDef SoundInit(void)
+{
+    HAL_StatusTypeDef st;
+    HAL_Delay(10); // 立ち上がり余裕
+
+    // 1) PUP
+    st = SOUND_SendPUP(SOUND_SPI_TIMEOUT_MS);
+    if (st != HAL_OK) return st;
+
+    // 2) AMODE
+#if (SOUND_USE_CLASS_D)
+    // Class-D（BTL直結）: DAMP=1, HPF=0, FAD=0, DAG=0, AIG=0, AEN=01, POP=0
+    st = SOUND_SendAMODE(1, 0, 0, 0, 0, 0, 1, 0, SOUND_SPI_TIMEOUT_MS);
+#else
+    // Class-AB（単端/コンデンサ直列）: DAMP=0, AEN=01
+    st = SOUND_SendAMODE(0, 0, 0, 0, 0, 0, 1, 0, SOUND_SPI_TIMEOUT_MS);
+#endif
+    if (st != HAL_OK) return st;
+
+    // 3) AVOL: 0 dB（例: 0x24）
+    st = SOUND_SendAVOL(0x24, SOUND_SPI_TIMEOUT_MS);
+    if (st != HAL_OK) return st;
+
+    // 4) CVOL: 全CH 0 dB（=0x00を各CHに設定でも良い）
+    for (uint8_t ch = 0; ch < 4; ch++) {
+        st = SOUND_SendCVOL(ch, 0x00, SOUND_SPI_TIMEOUT_MS);
+        if (st != HAL_OK) return st;
+    }
+    return HAL_OK;
+}
+
+HAL_StatusTypeDef Sound_ReadVersion(uint8_t *ver) {     // RDVER : 0xB4
+    return SOUND_Rd1(0xB4, ver, SOUND_SPI_TIMEOUT_MS);
+}
+HAL_StatusTypeDef Sound_ReadError(uint8_t *err) {       // RDERR : 0xB8
+    return SOUND_Rd1(0xB8, err, SOUND_SPI_TIMEOUT_MS);
+}
+
+// ================== 4ch/音量0-255の高レベルAPI ==================
+//
+// 機能:
+// ・4チャネル同時再生
+// ・全体/個別ボリュームを0?255（0=最小/ミュート, 255=最大）で指定
+// ・空きチャネル自動割り当て対応
+//
+// 既存の SOUND_SendPLAY / STOP / CVOL / AVOL を内部で使用
+
+static inline int in_range_int(int x, int lo, int hi){
+    return (unsigned)(x - lo) <= (unsigned)(hi - lo);
+}
+
+// ---- RDSTAT: BUSYB/NCR 用 ----
+static HAL_StatusTypeDef SOUND_Rd1(uint8_t cmd, uint8_t *out, uint32_t to_ms)
+{
+    HAL_StatusTypeDef st;
+    uint8_t dummy = 0x00;
+    st = SOUND_WaitReady(to_ms); if (st!=HAL_OK) return st;
+
+    SOUND_CS_L(); st = HAL_SPI_Transmit(&hspi1, &cmd, 1, to_ms); SOUND_CS_H();
+    if (st!=HAL_OK) return st;
+
+    SOUND_CS_L(); st = HAL_SPI_TransmitReceive(&hspi1, &dummy, out, 1, to_ms); SOUND_CS_H();
+    return st;
+}
+
+static HAL_StatusTypeDef Sound_ReadStatus(uint8_t *status)
+{
+    return SOUND_Rd1(0xB0, status, SOUND_SPI_TIMEOUT_MS);
+}
+#define RDSTAT_BUSYB(st,ch) (((st) >> (4 + ((ch)&3))) & 1)  // 1=アイドル, 0=再生中
+
+// ---------------- 再生API ----------------
+
+// 明示チャネル指定で再生
+int PlayOn(int ch, int phrase)
+{
+    if (!in_range_int(ch,0,3) || !in_range_int(phrase,0,1023)) return -1;
+    return (SOUND_SendPLAY((uint8_t)ch, (uint16_t)phrase, 50) == HAL_OK) ? ch : -1;
+}
+
+// 空きチャネルへ自動割り当て
+int PlayAuto(int phrase)
+{
+    if (!in_range_int(phrase,0,1023)) return -1;
+    uint8_t st=0;
+    if (Sound_ReadStatus(&st) != HAL_OK) return -1;
+
+    for (int ch=0; ch<4; ch++){
+        if (RDSTAT_BUSYB(st,ch)) {
+            if (SOUND_SendPLAY((uint8_t)ch, (uint16_t)phrase, 50) == HAL_OK) return ch;
+        }
+    }
+    return -1; // 全ch再生中
+}
+
+// 停止系
+void StopOn(int ch)  { if (in_range_int(ch,0,3)) (void)SOUND_SendSTOP((uint8_t)ch, 50); }
+void StopAll(void)   { for (uint8_t ch=0; ch<4; ch++) (void)SOUND_SendSTOP(ch, 50); }
+
+// ---------------- 音量変換 ----------------
+//
+// CVOL: 0=最大, 0x7F=ミュート
+// AVOL: 0?15段, 値が大きいほど減衰
+// ユーザー入力は共通で 0?255（0=最小/ミュート, 255=最大）
+
+static inline uint8_t map255_to_cvol(uint8_t ui)
+{
+    uint16_t t = (uint16_t)ui * 0x7Fu + 127u/2u;
+    return (uint8_t)(0x7F - (t / 255u));
+}
+
+static const uint8_t s_avol_code_tbl[16] = {
+    0x36,0x34,0x32,0x30,0x2E,0x2C,0x2A,0x28,
+    0x26,0x25,0x24,0x23,0x22,0x21,0x20,0x1E
+};
+static inline uint8_t map255_to_avol_code(uint8_t ui)
+{
+    uint16_t t = (uint16_t)ui * 15u + 127u;
+    uint8_t idx = (uint8_t)(15u - (t / 255u));
+    return s_avol_code_tbl[idx];
+}
+
+// 音量設定
+void SetCVol(int ch, uint8_t vol0_255)
+{
+    if (!in_range_int(ch,0,3)) return;
+    uint8_t cv = map255_to_cvol(vol0_255);
+    (void)SOUND_SendCVOL((uint8_t)ch, cv, 50);
+}
+void SetCVolAll(uint8_t vol0_255)
+{
+    uint8_t cv = map255_to_cvol(vol0_255);
+    for (uint8_t ch=0; ch<4; ch++) (void)SOUND_SendCVOL(ch, cv, 50);
+}
+void SetAVol(uint8_t vol0_255)
+{
+    uint8_t code = map255_to_avol_code(vol0_255);
+    (void)SOUND_SendAVOL(code, 50);
+}
+
+// ---------------- 下位互換ラッパ ----------------
+HAL_StatusTypeDef Play(int ch)
+{
+    if (!in_range_int(ch,0,3)) return HAL_ERROR;
+    return (PlayOn(ch, ch) >= 0) ? HAL_OK : HAL_ERROR;
+}
+HAL_StatusTypeDef Stop(int ch)
+{
+    if (!in_range_int(ch,0,3)) return HAL_ERROR;
+    StopOn(ch); return HAL_OK;
+}
+HAL_StatusTypeDef SetVolume(int ch, uint8_t vol7)
+{
+    if (!in_range_int(ch,0,3)) return HAL_ERROR;
+    uint8_t vol255 = (uint8_t)(255u - ((uint16_t)vol7 * 255u / 0x7Fu));
+    SetCVol(ch, vol255);
+    return HAL_OK;
+}
+
+//====================================================================
+// printfの代替関数
+//====================================================================
+// 送信：ブロッキング（最小・簡単）
+static inline void uart_tx(const uint8_t* p, uint16_t len)
+{
+//    HAL_UART_Transmit(&huart1, (uint8_t*)p, len, 100);
+    // DMAが動作中なら待つ
+    while (huart1.gState != HAL_UART_STATE_READY) { }
+
+    HAL_UART_Transmit_DMA(&huart1, (uint8_t*)p, len);
+
+    // 完了待ち
+    while (huart1.gState != HAL_UART_STATE_READY) { }
+
+}
+
+//============================================
+void printChar(char c)
+{
+    uart_tx((const uint8_t*)&c, 1);
+}
+//============================================
+
+void prints(const char* s)
+{
+    if (!s) return;
+    while (*s) {
+        printChar(*s++);
+    }
+}
+
+//============================================
+void println(const char* s)
+{
+    if (s) prints(s);
+    prints("\n");     // 端末に合わせて \n だけでもOK
+}
+
+//============================================
+// 10進整数出力（符号付き）
+void printInt(int32_t v)
+{
+    char buf[12]; // -2147483648 + '\0'
+    int i = 0;
+
+    if (v == 0) {
+        printChar('0');
+        return;
+    }
+
+    if (v < 0) {
+        printChar('-');
+        // INT32_MIN 対策
+        if (v == (int32_t)0x80000000) {
+            prints("2147483648");
+            return;
+        }
+        v = -v;
+    }
+
+    while (v > 0 && i < (int)sizeof(buf)-1) {
+        buf[i++] = (char)('0' + (v % 10));
+        v /= 10;
+    }
+    while (i--) {
+        printChar(buf[i]);
+    }
+}
+//============================================
+
+static const char HEX[] = "0123456789ABCDEF";
+
+//============================================
+void printHex(uint8_t v)
+{
+    printChar(HEX[(v >> 4) & 0xF]);
+    printChar(HEX[v & 0xF]);
+}
+//============================================
+void printHex16(uint16_t v)
+{
+    printHex((uint8_t)(v >> 8));
+    printHex((uint8_t)(v & 0xFF));
+}
+//============================================
+/* UART受信割り込みによるscanf対応 */
+int _read(int file, char *ptr, int len)
+{
+    int count = 0;
+    while (count < len)
+    {
+        // データが来るまで待機
+        while (rx_head == rx_tail) { /* wait */ }
+
+        char c = rx_buf[rx_tail];
+        rx_tail = (rx_tail + 1) % RX_BUF_SIZE;
+
+        // エコーバック（送信）
+        HAL_UART_Transmit(&huart2, (uint8_t*)&c, 1, HAL_MAX_DELAY);
+
+        ptr[count++] = c;
+
+        // 改行入力時に終了（scanfだとバッファに残るが）
+        if (c == '\n' || c == '\r') break;
+    }
+    return count;
+}
+
+/* 受信割り込み開始 */
+static uint8_t uart2_rx_hcar;
+
+void UART2_Start_Receive_IT(void)
+{
+    HAL_UART_Receive_IT(&huart2, &uart2_rx_hcar, 1);
+}
+
+/* 割り込みコールバック（受信完了時） */
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance == USART2)
+    {
+        uint8_t c = huart->pRxBuffPtr[-1]; // 直前に受信したデータ
+        uint16_t next_head = (rx_head + 1) % RX_BUF_SIZE;
+        if (next_head != rx_tail) // バッファあふれ防止
+        {
+            rx_buf[rx_head] = c;
+            rx_head = next_head;
+        }
+        // 次の1文字受信開始
+        UART2_Start_Receive_IT();
+    }
+}
+
+static void QA_1msTick(void)
+{
+  // TIMER_INTERVAL ms毎にここが呼び出される
+  int cVP, cVM;
+  int cState;
+
+  // Noise Cancel =====================
+  cVP = digitalRead_VP(); // VP_PIN → VPIN
+  cVM = digitalRead_VM(); // VM_PIN → VMIN
+
+  if (cVP == lVP) { VP = (uint8_t)cVP; }
+  if (cVM == lVM) { VM = (uint8_t)cVM; }
+  lVP = (uint8_t)cVP;
+  lVM = (uint8_t)cVM;
+  // ==================================
+  // VP/VM から状態判定
+  if (VM == VP) {
+    cState = QS_IDLE;
+  } else if (VP) {
+    cState = QS_SET;
+  } else {
+    cState = QS_RESET;
+  }
+  if (cState == QS_IDLE) {
+    // 何もしない
+    LastState = cState;
+    return;
+  }
+  digitalWrite_IO2(cState-1);
+
+  if (cState != LastState) {
+    // 状態が変化
+    CmdMode = true;
+
+    // 汽笛が鳴っていれば停止
+    if (IsWhistle) {
+      IsWhistle = false;
+      cmdq_push_isr(CMD_WHISTLE_OFF);
+      CmdMode = false;
+    }
+
+    // パルス幅でデコード
+    if ((PulseWidth >= PW_MIN) && (PulseWidth <= PW_LONG)) {
+      int bit = (PulseWidth < PW_CHK) ? 0 : 1;
+      digitalWrite_IO2(bit);
+      cCmd = (uint16_t)((cCmd << 1) + (uint16_t)bit);
+      cbitCnt++;
+      if (cbitCnt >= nextBitLen) {
+        cmdq_push_isr((int)cCmd);
+        if (cCmd == 0x30) {
+          nextBitLen = CBITLEN + 1;
+        } else {
+          nextBitLen = CBITLEN;
+          CmdMode = false;
+        }
+        cbitCnt = 0;
+        cCmd = 0;
+      }
+    } else if ((PulseWidth >= PW_BELL_MIN) && (PulseWidth <= PW_BELL_MAX)) {
+      cmdq_push_isr(CMD_BELL);
+      cbitCnt = 0;
+      cCmd = 0;
+      CmdMode = false;
+    }
+
+    // 反転からカウント再開
+    PulseWidth = 0;
+    LastState  = cState;
+    return;
+  }
+
+  // 状態継続中はカウントアップ＋可視化
+  digitalWrite_IO0(IsWhistle); // 旧: digitalWrite(4, IsWhistle)
+  digitalWrite_IO1(CmdMode);   // 旧: digitalWrite(5, CmdMode)
+
+  if (LastState == cState) {
+    if (PulseWidth <= PW_WHISTLE) {
+      PulseWidth++;
+    } else {
+      // 汽笛ON（コマンド中のみ）
+      if (CmdMode && (!IsWhistle)) {
+        IsWhistle = true;
+        cmdq_push_isr(CMD_WHISTLE_ON);
+      }
+    }
+    LastState = cState;
+  }
+}
+
+/* ====== メインループ側：キューを吐き出す（Serial→printf） ====== */
+static void QA_Task(void)
+{
+  int cmd = cmdq_pop();
+
+  if (cmd < 0) return;
+#ifdef CMD_DEBUG
+  int cmdNo;
+  cmdNo=GetCmdNo(cmd);
+  if(cmdNo>=0){
+    //printf("%s(%04X)\n",cmdName[cmdNo],(unsigned)cmd);
+    prints(cmdName[cmdNo]);
+    printChar(':');
+    printHex16(cmd);
+    println("");
+    LastCmd=cmdName[cmdNo];
+
+  }else{
+//      printf("CMD: 0x%04X\n", (unsigned)cmd);
+	    prints("CMD:");	   printHex16(cmd);	    println("");
+      LastCmd=NULL;
+}
+
+#else
+  switch (cmd) {
+    case CMD_WHISTLE_ON:  println("WHISTLE ON");  break;
+    case CMD_WHISTLE_OFF: println("WHISTLE OFF"); break;
+    case CMD_BELL:        println("BELL");        break;
+    default:
+      // 受信コマンド（11/12bit想定）をそのまま表示
+      //printf("CMD: 0x%04X\r\n", (unsigned)cmd);
+    	prints("CMD:");	   printHex16(cmd);	    println("");
+      break;
+  }
+#endif
+}
+
+static void QA_Init(void)
+{
+  // 出力初期化（IO0/IO1 は CubeMX 側で Output 設定済み前提）
+  digitalWrite_IO0(0);
+  digitalWrite_IO1(0);
+
+  // 状態初期化
+  lVP = digitalRead_VP();
+  lVM = digitalRead_VM();
+  VP = lVP; VM = lVM;
+  LastState  = QS_IDLE;
+  PulseWidth = 0;
+  CmdMode    = false;
+  IsWhistle  = false;
+  cCmd       = 0;
+  cbitCnt    = 0;
+  nextBitLen = CBITLEN;
+
+  // バナー（SerialPrint→printf 置換）
+  //printf("QA Analyzer STM32C011F6, TIM14 %dms\n", TIMER_INTERVAL);
+  prints("QA Analyzer STM32C011F6, TIM14 ");	printInt(TIMER_INTERVAL);	    println("ms");
+
+  // TIM14 1ms 割り込み開始（CubeMXで 1kHz 設定済みを想定）
+  HAL_TIM_Base_Start_IT(&htim14);
+}
+
+#if 0
+void SPI1_SanityTest(void) {
+    uint8_t pat[2] = {0xAA, 0x55};
+    for (int i=0; i<4; i++) {
+        HAL_GPIO_WritePin(NCS_GPIO_Port, NCS_Pin, GPIO_PIN_RESET);
+        HAL_SPI_Transmit(&hspi1, pat, sizeof pat, 100);
+        HAL_GPIO_WritePin(NCS_GPIO_Port, NCS_Pin, GPIO_PIN_SET);
+        HAL_Delay(1);
+    }
+}
+#endif
+
+
+//=============================================================================
+// Play Test
+//=============================================================================
+// ──────────────────────────────────────────────────────────────
+// ツールのCSV手順をほぼそのまま再現する再生シーケンス
+//   送信順： PUP → AMODE(0x04,0xC3) → 0x0C,0x01 → AVOL(0x08,0x24)
+//            CVOL A1/A2/A4/A8 = 0dB → 0x30,0x00 → RDSTAT → 0x51(開始)
+//            以降 RDSTAT を約2ms周期でポーリング
+//   注: CSVのサブms間隔は HAL_Delay では表現できないので、1ms未満は無待ち。
+// ──────────────────────────────────────────────────────────────
+
+static HAL_StatusTypeDef tx1(uint8_t b, uint32_t to_ms)
+{
+    return SOUND_Tx(&b, 1, to_ms);
+}
+
+static HAL_StatusTypeDef tx2(uint8_t b1, uint8_t b2, uint32_t to_ms)
+{
+    uint8_t tx[2] = { b1, b2 };
+    return SOUND_Tx(tx, 2, to_ms);
+}
+
+// RDSTATをツール流儀（ダミー=0xFF）で1バイト読む
+static HAL_StatusTypeDef rdstat_ff(uint8_t *p, uint32_t to_ms)
+{
+    HAL_StatusTypeDef st;
+    uint8_t cmd = 0xB0;
+    uint8_t dummy = 0xFF;
+
+    // コマンド（CS↓で1B）
+    SOUND_CS_L();
+    st = HAL_SPI_Transmit(&hspi1, &cmd, 1, to_ms);
+    SOUND_CS_H();
+    if (st != HAL_OK) return st;
+
+    // ダミーを送りながら1B受信（CS↓で1B）
+    SOUND_CS_L();
+    st = HAL_SPI_TransmitReceive(&hspi1, &dummy, p, 1, to_ms);
+    SOUND_CS_H();
+
+    return st;
+}
+
+// CSVと同順・同感覚の「開始」シーケンス
+HAL_StatusTypeDef Sound_PlayLikeTool(void)
+{
+    HAL_StatusTypeDef st;
+    uint8_t s;
+
+    // 1) PUP (0x00)
+    st = tx1(0x00, 50);                  if (st != HAL_OK) return st;
+    HAL_Delay(7);                        // ? 7.014 ms
+
+    // 2) AMODE 相当（0x04, 0xC3）
+    st = tx2(0x04, 0xC3, 50);            if (st != HAL_OK) return st;
+    HAL_Delay(39);                       // ? 38.557 ms
+
+    // 3) 不明コマンド（CSV: 0x0C, 0x01）
+    st = tx2(0x0C, 0x01, 50);            if (st != HAL_OK) return st;
+    // 以下の数百μs級はHAL_Delayでは無視
+
+    // 4) AVOL 0 dB（0x08, 0x24）
+    st = tx2(0x08, 0x24, 50);            if (st != HAL_OK) return st;
+
+    // 5) CVOL 各CH = 0 dB（A1/A2/A4/A8, 00）
+    st = tx2(0xA1, 0x00, 50);            if (st != HAL_OK) return st;
+    st = tx2(0xA2, 0x00, 50);            if (st != HAL_OK) return st;
+    st = tx2(0xA4, 0x00, 50);            if (st != HAL_OK) return st;
+    st = tx2(0xA8, 0x00, 50);            if (st != HAL_OK) return st;
+
+    // 6) CSV: 0x30, 0x00（ツール側の動作モード設定の一種）
+    st = tx2(0x30, 0x00, 50);            if (st != HAL_OK) return st;
+
+    // 7) RDSTAT（1回目）：B0 → (ダミーFFで1B受信)
+    st = rdstat_ff(&s, 50);              if (st != HAL_OK) return st;
+
+    // 8) CSV: 0x51（1バイトの開始トリガ）
+    st = tx1(0x51, 50);                  if (st != HAL_OK) return st;
+
+    // 9) RDSTATポーリング（約2ms周期、≒CSV平均1.87ms）
+    for (int i = 0; i < 2400; i++) {     // ? 4.8 秒ぶん
+        st = rdstat_ff(&s, 50);
+        if (st != HAL_OK) return st;
+        HAL_Delay(2);
+    }
+    return HAL_OK;
+}
+
+// ==== ループ制御コマンド ====
+// SLOOP（1B）：0x52　→　ループ再生開始
+// CLOOP（1B）：0x53　→　ループ再生解除
+// NCR=Hの期間で有効。対象は「再生中のチャンネル」。
+
+static HAL_StatusTypeDef SOUND_SendSLOOP(void)
+{
+    uint8_t b = 0x52;
+    return SOUND_Tx(&b, 1, 50);
+}
+
+static HAL_StatusTypeDef SOUND_SendCLOOP(void)
+{
+    uint8_t b = 0x53;
+    return SOUND_Tx(&b, 1, 50);
+}
+
+// ==== 公開API ====
+
+HAL_StatusTypeDef Loop(int ch)
+{
+    HAL_StatusTypeDef st;
+
+    // 通常再生開始
+    st = SOUND_SendPLAY((uint8_t)ch, (uint16_t)ch, 50);
+    if (st != HAL_OK) return st;
+
+    // NCRがHになるまで少し待つ（デバイス仕様上必須）
+    HAL_Delay(20);
+
+    // SLOOP送信（ループ再生ON）
+    return SOUND_SendSLOOP();
+}
+
+HAL_StatusTypeDef LoopEnd(void)
+{
+    // CLOOP送信（ループ解除）
+    return SOUND_SendCLOOP();
+}
+
+
+/* USER CODE END 0 */
+
+/**
+  * @brief  The application entry point.
+  * @retval int
+  */
+int main(void)
+{
+
+  /* USER CODE BEGIN 1 */
+
+  /* USER CODE END 1 */
+
+  /* MCU Configuration--------------------------------------------------------*/
+
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+  HAL_Init();
+
+  /* USER CODE BEGIN Init */
+
+  /* USER CODE END Init */
+
+  /* Configure the system clock */
+  SystemClock_Config();
+
+  /* USER CODE BEGIN SysInit */
+
+  /* USER CODE END SysInit */
+
+  /* Initialize all configured peripherals */
+  MX_GPIO_Init();
+  MX_DMA_Init();
+  MX_ADC1_Init();
+  MX_SPI1_Init();
+  MX_USART1_UART_Init();
+  MX_USART2_UART_Init();
+  MX_TIM14_Init();
+  /* USER CODE BEGIN 2 */
+  // 受信割り込み開始
+   UART2_Start_Receive_IT();
+   QA_Init();   // 初期化（UARTバナー、IO初期状態、TIM14割り込み開始）
+   SOUND_CS_H();
+   delay_ms(100);
+
+   //setvbuf(stdout, NULL, _IONBF, 0); // printfバッファ無効化
+
+   //SPI1_SanityTest();
+
+   //==================================================
+   // Sound Check
+   //==================================================
+   SoundInit();
+   //Sound_PlayLikeTool();
+   /*
+		// 初期化直後の推奨設定
+		SetAVol(255);          // 全体=最大
+		SetCVolAll(255);       // 各ch=最大
+
+		// AとBを同時発音
+		PlayOn(0, 0);          // CH0 ← フレーズ0
+		PlayOn(1, 1);          // CH1 ← フレーズ1
+
+		// Bを少し絞る（約半分）
+		SetCVol(1, 128);
+
+		// 空いているチャネルに自動割当
+		int ch = PlayAuto(2);
+
+		// 停止
+		StopOn(0);
+		StopAll();
+    */
+	// 初期化直後の推奨設定
+	SetAVol(255);          // 全体=最大
+	SetCVolAll(255);       // 各ch=最大
+
+  /* USER CODE END 2 */
+
+  /* Infinite loop */
+  /* USER CODE BEGIN WHILE */
+  while (1)
+  {
+	  int KeyNo;
+	  QA_Task(); // Arduino の loop 相当：受信コマンドをprintfで出力
+	  if(LastCmd!=NULL){
+		  KeyNo=atoi(LastCmd)-1;
+		  LastCmd=NULL;
+		  if((KeyNo>=0)&&(KeyNo<5)){
+			  	StopAll();
+				PlayOn(0, KeyNo);          // CH0 ← フレーズ0
+		  }
+	  }
+    /* USER CODE END WHILE */
+
+    /* USER CODE BEGIN 3 */
+  }
+  /* USER CODE END 3 */
+}
+
+/**
+  * @brief System Clock Configuration
+  * @retval None
+  */
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+  __HAL_FLASH_SET_LATENCY(FLASH_LATENCY_1);
+
+  /** Initializes the RCC Oscillators according to the specified parameters
+  * in the RCC_OscInitTypeDef structure.
+  */
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+  RCC_OscInitStruct.HSIDiv = RCC_HSI_DIV1;
+  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Initializes the CPU, AHB and APB buses clocks
+  */
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_HSI;
+  RCC_ClkInitStruct.SYSCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_HCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_APB1_DIV1;
+
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
+  * @brief ADC1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_ADC1_Init(void)
+{
+
+  /* USER CODE BEGIN ADC1_Init 0 */
+
+  /* USER CODE END ADC1_Init 0 */
+
+  ADC_ChannelConfTypeDef sConfig = {0};
+
+  /* USER CODE BEGIN ADC1_Init 1 */
+
+  /* USER CODE END ADC1_Init 1 */
+
+  /** Configure the global features of the ADC (Clock, Resolution, Data Alignment and number of conversion)
+  */
+  hadc1.Instance = ADC1;
+  hadc1.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV2;
+  hadc1.Init.Resolution = ADC_RESOLUTION_12B;
+  hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
+  hadc1.Init.ScanConvMode = ADC_SCAN_SEQ_FIXED;
+  hadc1.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
+  hadc1.Init.LowPowerAutoWait = DISABLE;
+  hadc1.Init.LowPowerAutoPowerOff = DISABLE;
+  hadc1.Init.ContinuousConvMode = DISABLE;
+  hadc1.Init.NbrOfConversion = 1;
+  hadc1.Init.DiscontinuousConvMode = DISABLE;
+  hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
+  hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
+  hadc1.Init.DMAContinuousRequests = DISABLE;
+  hadc1.Init.Overrun = ADC_OVR_DATA_PRESERVED;
+  hadc1.Init.SamplingTimeCommon1 = ADC_SAMPLETIME_1CYCLE_5;
+  hadc1.Init.OversamplingMode = DISABLE;
+  hadc1.Init.TriggerFrequencyMode = ADC_TRIGGER_FREQ_HIGH;
+  if (HAL_ADC_Init(&hadc1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure Regular Channel
+  */
+  sConfig.Channel = ADC_CHANNEL_0;
+  sConfig.Rank = ADC_RANK_CHANNEL_NUMBER;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN ADC1_Init 2 */
+
+  /* USER CODE END ADC1_Init 2 */
+
+}
+
+/**
+  * @brief SPI1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_SPI1_Init(void)
+{
+
+  /* USER CODE BEGIN SPI1_Init 0 */
+
+  /* USER CODE END SPI1_Init 0 */
+
+  /* USER CODE BEGIN SPI1_Init 1 */
+
+  /* USER CODE END SPI1_Init 1 */
+  /* SPI1 parameter configuration*/
+  hspi1.Instance = SPI1;
+  hspi1.Init.Mode = SPI_MODE_MASTER;
+  hspi1.Init.Direction = SPI_DIRECTION_2LINES;
+  hspi1.Init.DataSize = SPI_DATASIZE_8BIT;
+  hspi1.Init.CLKPolarity = SPI_POLARITY_HIGH;
+  hspi1.Init.CLKPhase = SPI_PHASE_2EDGE;
+  hspi1.Init.NSS = SPI_NSS_SOFT;
+  hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_64;
+  hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
+  hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
+  hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
+  hspi1.Init.CRCPolynomial = 7;
+  hspi1.Init.CRCLength = SPI_CRC_LENGTH_DATASIZE;
+  hspi1.Init.NSSPMode = SPI_NSS_PULSE_DISABLE;
+  if (HAL_SPI_Init(&hspi1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN SPI1_Init 2 */
+
+  /* USER CODE END SPI1_Init 2 */
+
+}
+
+/**
+  * @brief TIM14 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM14_Init(void)
+{
+
+  /* USER CODE BEGIN TIM14_Init 0 */
+
+  /* USER CODE END TIM14_Init 0 */
+
+  /* USER CODE BEGIN TIM14_Init 1 */
+
+  /* USER CODE END TIM14_Init 1 */
+  htim14.Instance = TIM14;
+  htim14.Init.Prescaler = 999;
+  htim14.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim14.Init.Period = 47;
+  htim14.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim14.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim14) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM14_Init 2 */
+
+  /* USER CODE END TIM14_Init 2 */
+
+}
+
+/**
+  * @brief USART1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART1_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART1_Init 0 */
+
+  /* USER CODE END USART1_Init 0 */
+
+  /* USER CODE BEGIN USART1_Init 1 */
+
+  /* USER CODE END USART1_Init 1 */
+  huart1.Instance = USART1;
+  huart1.Init.BaudRate = 115200;
+  huart1.Init.WordLength = UART_WORDLENGTH_8B;
+  huart1.Init.StopBits = UART_STOPBITS_1;
+  huart1.Init.Parity = UART_PARITY_NONE;
+  huart1.Init.Mode = UART_MODE_TX_RX;
+  huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart1.Init.OverSampling = UART_OVERSAMPLING_16;
+  huart1.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
+  huart1.Init.ClockPrescaler = UART_PRESCALER_DIV1;
+  huart1.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
+  if (HAL_UART_Init(&huart1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_SetTxFifoThreshold(&huart1, UART_TXFIFO_THRESHOLD_1_8) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_SetRxFifoThreshold(&huart1, UART_RXFIFO_THRESHOLD_1_8) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_DisableFifoMode(&huart1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART1_Init 2 */
+
+  /* USER CODE END USART1_Init 2 */
+
+}
+
+/**
+  * @brief USART2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART2_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART2_Init 0 */
+
+  /* USER CODE END USART2_Init 0 */
+
+  /* USER CODE BEGIN USART2_Init 1 */
+
+  /* USER CODE END USART2_Init 1 */
+  huart2.Instance = USART2;
+  huart2.Init.BaudRate = 115200;
+  huart2.Init.WordLength = UART_WORDLENGTH_8B;
+  huart2.Init.StopBits = UART_STOPBITS_1;
+  huart2.Init.Parity = UART_PARITY_NONE;
+  huart2.Init.Mode = UART_MODE_TX_RX;
+  huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart2.Init.OverSampling = UART_OVERSAMPLING_16;
+  huart2.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
+  huart2.Init.ClockPrescaler = UART_PRESCALER_DIV1;
+  huart2.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
+  if (HAL_UART_Init(&huart2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART2_Init 2 */
+
+  /* USER CODE END USART2_Init 2 */
+
+}
+
+/**
+  * Enable DMA controller clock
+  */
+static void MX_DMA_Init(void)
+{
+
+  /* DMA controller clock enable */
+  __HAL_RCC_DMA1_CLK_ENABLE();
+
+  /* DMA interrupt init */
+  /* DMA1_Channel1_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Channel1_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Channel1_IRQn);
+
+}
+
+/**
+  * @brief GPIO Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_GPIO_Init(void)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+  /* USER CODE BEGIN MX_GPIO_Init_1 */
+
+  /* USER CODE END MX_GPIO_Init_1 */
+
+  /* GPIO Ports Clock Enable */
+  __HAL_RCC_GPIOC_CLK_ENABLE();
+  __HAL_RCC_GPIOF_CLK_ENABLE();
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOA, IO2_Pin|NCS_Pin, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOB, IO0_Pin|IO1_Pin, GPIO_PIN_RESET);
+
+  /*Configure GPIO pins : VMIN_Pin VPIN_Pin */
+  GPIO_InitStruct.Pin = VMIN_Pin|VPIN_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : Button_Pin */
+  GPIO_InitStruct.Pin = Button_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(Button_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : IO2_Pin NCS_Pin */
+  GPIO_InitStruct.Pin = IO2_Pin|NCS_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : CBUSY_Pin */
+  GPIO_InitStruct.Pin = CBUSY_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(CBUSY_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : IO0_Pin IO1_Pin */
+  GPIO_InitStruct.Pin = IO0_Pin|IO1_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  /* USER CODE BEGIN MX_GPIO_Init_2 */
+
+  /* USER CODE END MX_GPIO_Init_2 */
+}
+
+/* USER CODE BEGIN 4 */
+
+/* USER CODE END 4 */
+
+/**
+  * @brief  This function is executed in case of error occurrence.
+  * @retval None
+  */
+void Error_Handler(void)
+{
+  /* USER CODE BEGIN Error_Handler_Debug */
+  /* User can add his own implementation to report the HAL error return state */
+  __disable_irq();
+  while (1)
+  {
+  }
+  /* USER CODE END Error_Handler_Debug */
+}
+#ifdef USE_FULL_ASSERT
+/**
+  * @brief  Reports the name of the source file and the source line number
+  *         where the assert_param error has occurred.
+  * @param  file: pointer to the source file name
+  * @param  line: assert_param error line source number
+  * @retval None
+  */
+void assert_failed(uint8_t *file, uint32_t line)
+{
+  /* USER CODE BEGIN 6 */
+  /* User can add his own implementation to report the file name and line number,
+     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
+  /* USER CODE END 6 */
+}
+#endif /* USE_FULL_ASSERT */
