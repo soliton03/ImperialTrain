@@ -69,8 +69,8 @@ void Error_Handler(void);
 #define NCS_GPIO_Port GPIOA
 #define IO0_Pin GPIO_PIN_6
 #define IO0_GPIO_Port GPIOB
-#define IO1_Pin GPIO_PIN_7
-#define IO1_GPIO_Port GPIOB
+#define nTailLED_Pin GPIO_PIN_7
+#define nTailLED_GPIO_Port GPIOB
 #define VPIN_Pin GPIO_PIN_14
 #define VPIN_GPIO_Port GPIOC
 

@@ -69,6 +69,15 @@ DMA_HandleTypeDef hdma_usart1_tx;
 #define CMD_WHISTLE_OFF  0xF000
 #define CMD_BELL         0xF002
 
+#define ON	1
+#define OFF	0
+
+//極性判定回路用==========================
+#define DIR_CHK_CNT	100		//100ms安定で判定
+int IsNormalDir=true;		//falseなら尾灯は不点灯
+int CurrentDir=true;		//Trueなら進行方向
+int DirCount=DIR_CHK_CNT;
+
 typedef enum {
   QS_IDLE  = 0,
   QS_SET   = 1,
@@ -91,8 +100,8 @@ static inline int digitalRead_VM(void){
 static inline void digitalWrite_IO0(int level){
   HAL_GPIO_WritePin(IO0_GPIO_Port, IO0_Pin, level ? GPIO_PIN_SET : GPIO_PIN_RESET);
 }
-static inline void digitalWrite_IO1(int level){
-  HAL_GPIO_WritePin(IO1_GPIO_Port, IO1_Pin, level ? GPIO_PIN_SET : GPIO_PIN_RESET);
+static inline void SetTailLED(int level){
+  HAL_GPIO_WritePin(nTailLED_GPIO_Port, nTailLED_Pin, level ? GPIO_PIN_RESET : GPIO_PIN_SET);
 }
 
 static inline void digitalWrite_IO2(int level){
@@ -113,9 +122,9 @@ static inline int cmdq_pop(void){
 }
 
 /* ====== 変数（Arduinoスケッチ由来） ====== */
-static volatile uint8_t  lVP = 0, lVM = 0; // 直近サンプル
-static volatile uint8_t  VP  = 0, VM  = 0; // ノイズキャンセル後
-static volatile int      LastState   = QS_IDLE;
+static volatile uint8_t  lVM = 0; // 直近サンプル
+static volatile uint8_t  VM  = 0; // ノイズキャンセル後
+static volatile int      LastState   = QS_IDLE;	//実際には存在しないが便宜上入れておく
 static volatile uint16_t PulseWidth  = 0;
 static volatile bool     CmdMode     = false;
 static volatile bool     IsWhistle   = false;
@@ -199,7 +208,7 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
   if (htim->Instance == TIM14)
   {
-	  //QA_1msTick();	//とりあえずサービス停止
+	  QA_1msTick();
 	  if(MS_COUNT>0){
 		  MS_COUNT--;   // 任意の処理（フラグやソフトタイマ更新など）
 	  }
@@ -229,6 +238,17 @@ uint32_t adc_tick;
 static inline uint32_t Elapsed(uint32_t last)
 {
     return HAL_GetTick() - last;
+}
+
+int32_t Get_mV(int adcval){
+	return (int32_t)adcval*3300/4095;
+}
+
+//PowerPackの入力電圧をVで表示(unit=0.1V)
+int GetPower_mV(int x){
+	int v;
+	v=Get_mV(x)*10;
+	return v;
 }
 
 //====================================================================
@@ -570,25 +590,33 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 static void QA_1msTick(void)
 {
   // TIMER_INTERVAL ms毎にここが呼び出される
-  int cVP, cVM;
+  int cVM;
   int cState;
 
   // Noise Cancel =====================
-  cVP = digitalRead_VP(); // VP_PIN → VPIN
   cVM = digitalRead_VM(); // VM_PIN → VMIN
-
-  if (cVP == lVP) { VP = (uint8_t)cVP; }
   if (cVM == lVM) { VM = (uint8_t)cVM; }
-  lVP = (uint8_t)cVP;
   lVM = (uint8_t)cVM;
   // ==================================
-  // VP/VM から状態判定
-  if (VM == VP) {
-    cState = QS_IDLE;
-  } else if (VP) {
-    cState = QS_SET;
-  } else {
-    cState = QS_RESET;
+  //方向判定============================
+  if(cVM!=CurrentDir){
+	  //極性が変化
+	  DirCount=DIR_CHK_CNT;
+  }else{
+	  if(DirCount>0){
+		  DirCount--;
+		  if(DirCount==0){
+			  IsNormalDir=CurrentDir;
+		  }
+	  }
+  }
+  CurrentDir=cVM;
+  return;	//とりあえず方向反転のみ
+  // VM から状態判定
+  if(VM){
+	    cState = QS_RESET;
+  }else{
+	    cState = QS_SET;
   }
   if (cState == QS_IDLE) {
     // 何もしない
@@ -640,7 +668,7 @@ static void QA_1msTick(void)
 
   // 状態継続中はカウントアップ＋可視化
   digitalWrite_IO0(IsWhistle); // 旧: digitalWrite(4, IsWhistle)
-  digitalWrite_IO1(CmdMode);   // 旧: digitalWrite(5, CmdMode)
+  //digitalWrite_IO1(CmdMode);   // 旧: digitalWrite(5, CmdMode)
 
   if (LastState == cState) {
     if (PulseWidth <= PW_WHISTLE) {
@@ -691,12 +719,12 @@ static void QA_Init(void)
 {
   // 出力初期化（IO0/IO1 は CubeMX 側で Output 設定済み前提）
   digitalWrite_IO0(0);
-  digitalWrite_IO1(0);
+  //digitalWrite_IO1(0);
+  SetTailLED(OFF);
 
   // 状態初期化
-  lVP = digitalRead_VP();
   lVM = digitalRead_VM();
-  VP = lVP; VM = lVM;
+  VM = lVM;
   LastState  = QS_IDLE;
   PulseWidth = 0;
   CmdMode    = false;
@@ -953,15 +981,24 @@ int main(void)
 		  }
 	  }
 #else
+	  //TailLampの処理==============================================
+	  SetTailLED(IsNormalDir);
+
+	  //ADCの取得===================================================
 	    if (Elapsed(adc_tick) >= 1000)
 	    {
 	        adc_tick += 1000;     // ← nowにしないのがポイント
 
 	        int val = AdcRead();
+	        int v,vi,vd;
 	        if(val>=0){
-	        	printf("ADC=%u\r\n", val);
+	        	v=GetPower_mV(val);
+	        	vi=v/1000;
+	        	vd=(v%1000)/100;
+	        	printf("PowerPack=%d.%dV\n",vi,vd );
 	        }
 	    }
+
 
 #endif
     /* USER CODE END WHILE */
@@ -1259,7 +1296,7 @@ static void MX_GPIO_Init(void)
   HAL_GPIO_WritePin(GPIOA, IO2_Pin|NCS_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOB, IO0_Pin|IO1_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOB, IO0_Pin|nTailLED_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pins : VMIN_Pin VPIN_Pin */
   GPIO_InitStruct.Pin = VMIN_Pin|VPIN_Pin;
@@ -1286,8 +1323,8 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(CBUSY_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : IO0_Pin IO1_Pin */
-  GPIO_InitStruct.Pin = IO0_Pin|IO1_Pin;
+  /*Configure GPIO pins : IO0_Pin nTailLED_Pin */
+  GPIO_InitStruct.Pin = IO0_Pin|nTailLED_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
