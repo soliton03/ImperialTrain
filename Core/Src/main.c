@@ -234,6 +234,7 @@ int AdcRead(){
     return val;
 }
 uint32_t adc_tick;
+int PowerMV=0;	//PowerPackの電圧（mV単位）
 
 static inline uint32_t Elapsed(uint32_t last)
 {
@@ -611,7 +612,7 @@ static void QA_1msTick(void)
 	  }
   }
   CurrentDir=cVM;
-  return;	//とりあえず方向反転のみ
+
   // VM から状態判定
   if(VM){
 	    cState = QS_RESET;
@@ -927,7 +928,6 @@ int main(void)
    HAL_ADCEx_Calibration_Start(&hadc1);
    adc_tick = HAL_GetTick();
 
-   /*
    SOUND_CS_H();
    delay_ms(100);
 
@@ -938,30 +938,27 @@ int main(void)
    // Sound Check
    //==================================================
    SoundInit();
- */
    //Sound_PlayLikeTool();
-   /*
-		// 初期化直後の推奨設定
-		SetAVol(255);          // 全体=最大
-		SetCVolAll(255);       // 各ch=最大
+   // 初期化直後の推奨設定
+	SetAVol(255);          // 全体=最大
+	SetCVolAll(255);       // 各ch=最大
 
-		// AとBを同時発音
-		PlayOn(0, 0);          // CH0 ← フレーズ0
-		PlayOn(1, 1);          // CH1 ← フレーズ1
+	// AとBを同時発音
+	PlayOn(0, 0);          // CH0 ← フレーズ0
+	PlayOn(1, 1);          // CH1 ← フレーズ1
 
-		// Bを少し絞る（約半分）
-		SetCVol(1, 128);
+	// Bを少し絞る（約半分）
+	SetCVol(1, 128);
 
-		// 空いているチャネルに自動割当
-		int ch = PlayAuto(2);
+	// 空いているチャネルに自動割当
+	PlayAuto(2);
 
-		// 停止
-		StopOn(0);
-		StopAll();
-    */
+	// 停止
+	StopOn(0);
+	StopAll();
 	// 初期化直後の推奨設定
-//	SetAVol(255);          // 全体=最大
-//	SetCVolAll(255);       // 各ch=最大
+	SetAVol(255);          // 全体=最大
+	SetCVolAll(255);       // 各ch=最大
 
   /* USER CODE END 2 */
 
@@ -969,7 +966,6 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-#if 0
 	  int KeyNo;
 	  QA_Task(); // Arduino の loop 相当：受信コマンドをprintfで出力
 	  if(LastCmd!=NULL){
@@ -980,7 +976,6 @@ int main(void)
 				PlayOn(0, KeyNo);          // CH0 ← フレーズ0
 		  }
 	  }
-#else
 	  //TailLampの処理==============================================
 	  SetTailLED(IsNormalDir);
 
@@ -990,17 +985,11 @@ int main(void)
 	        adc_tick += 1000;     // ← nowにしないのがポイント
 
 	        int val = AdcRead();
-	        int v,vi,vd;
 	        if(val>=0){
-	        	v=GetPower_mV(val);
-	        	vi=v/1000;
-	        	vd=(v%1000)/100;
-	        	printf("PowerPack=%d.%dV\n",vi,vd );
+	        	PowerMV=GetPower_mV(val);
 	        }
 	    }
 
-
-#endif
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
