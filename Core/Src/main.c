@@ -843,45 +843,75 @@ HAL_StatusTypeDef Sound_PlayLikeTool(void)
 }
 
 // ==== ループ制御コマンド ====
-// SLOOP（1B）：0x52　→　ループ再生開始
-// CLOOP（1B）：0x53　→　ループ再生解除
-// NCR=Hの期間で有効。対象は「再生中のチャンネル」。
+// SLOOP（1B）: 1000 CH3 CH2 CH1 CH0
+// CLOOP（1B）: 1001 CH3 CH2 CH1 CH0
+// ch = 0..3
+// 例: ch0 -> SLOOP=0x81, CLOOP=0x91
 
-static HAL_StatusTypeDef SOUND_SendSLOOP(void)
+static HAL_StatusTypeDef SOUND_SendSLOOP(uint8_t ch)
 {
-    uint8_t b = 0x52;
-    return SOUND_Tx(&b, 1, 50);
+    if (ch > 3) return HAL_ERROR;
+    uint8_t b = (uint8_t)(0x80u | (1u << ch));
+    return SOUND_Tx(&b, 1, SOUND_SPI_TIMEOUT_MS);
 }
 
-static HAL_StatusTypeDef SOUND_SendCLOOP(void)
+static HAL_StatusTypeDef SOUND_SendCLOOP(uint8_t ch)
 {
-    uint8_t b = 0x53;
-    return SOUND_Tx(&b, 1, 50);
+    if (ch > 3) return HAL_ERROR;
+    uint8_t b = (uint8_t)(0x90u | (1u << ch));
+    return SOUND_Tx(&b, 1, SOUND_SPI_TIMEOUT_MS);
 }
 
 // ==== 公開API ====
+// 通常再生
+HAL_StatusTypeDef LoopPlayOn(int ch, int phrase)
+{
+    if (!in_range_int(ch, 0, 3) || !in_range_int(phrase, 0, 1023)) {
+        return HAL_ERROR;
+    }
 
-HAL_StatusTypeDef Loop(int ch)
+    return SOUND_SendPLAY((uint8_t)ch, (uint16_t)phrase, SOUND_SPI_TIMEOUT_MS);
+}
+
+// ループ再生
+HAL_StatusTypeDef LoopOn(int ch, int phrase)
 {
     HAL_StatusTypeDef st;
 
-    // 通常再生開始
-    st = SOUND_SendPLAY((uint8_t)ch, (uint16_t)ch, 50);
+    if (!in_range_int(ch, 0, 3) || !in_range_int(phrase, 0, 1023)) {
+        return HAL_ERROR;
+    }
+
+    st = SOUND_SendPLAY((uint8_t)ch, (uint16_t)phrase, SOUND_SPI_TIMEOUT_MS);
     if (st != HAL_OK) return st;
 
-    // NCRがHになるまで少し待つ（デバイス仕様上必須）
-    HAL_Delay(20);
+    // まずは短めで試す
+    HAL_Delay(1);
 
-    // SLOOP送信（ループ再生ON）
-    return SOUND_SendSLOOP();
+    return SOUND_SendSLOOP((uint8_t)ch);
 }
 
-HAL_StatusTypeDef LoopEnd(void)
+// ループ解除
+HAL_StatusTypeDef LoopOff(int ch)
 {
-    // CLOOP送信（ループ解除）
-    return SOUND_SendCLOOP();
+    if (!in_range_int(ch, 0, 3)) {
+        return HAL_ERROR;
+    }
+
+    return SOUND_SendCLOOP((uint8_t)ch);
 }
 
+
+int IsPlaying(int ch)
+{
+    uint8_t st = 0;
+
+    if (!in_range_int(ch, 0, 3)) return 0;
+    if (Sound_ReadStatus(&st) != HAL_OK) return 0;
+
+    // RDSTAT_BUSYB: 1=アイドル, 0=再生中
+    return RDSTAT_BUSYB(st, ch) ? 0 : 1;
+}
 
 /* USER CODE END 0 */
 
@@ -972,8 +1002,15 @@ int main(void)
 		  KeyNo=atoi(LastCmd)-1;
 		  LastCmd=NULL;
 		  if((KeyNo>=0)&&(KeyNo<5)){
-			  	StopAll();
-				PlayOn(0, KeyNo);          // CH0 ← フレーズ0
+			  	//StopAll();
+			  	StopOn(0);
+			  	if(KeyNo==1){
+			  		LoopOn(0, KeyNo);
+			  	}else{
+					//PlayOn(0, KeyNo);          // CH0 ← フレーズ0
+				  	LoopPlayOn(0, KeyNo);
+
+			  	}
 		  }
 	  }
 	  //TailLampの処理==============================================
