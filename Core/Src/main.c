@@ -55,6 +55,22 @@ UART_HandleTypeDef huart2;
 DMA_HandleTypeDef hdma_usart1_tx;
 
 /* USER CODE BEGIN PV */
+
+//=====================================
+// 電圧スレッシュホールド
+//=====================================
+//#define POWER_CHECK_MODE	//シリアルポートで電圧をチェック
+
+#define POWER_ON_TH		5300	//6.5Vを超えたとき
+#define POWER_OFF_TH	4700	//6.0Vを下回った時
+
+enum enPowerState{
+	powerIdle,powerStart,powerON,powerStop
+};
+
+int PowerState=powerIdle;
+
+
 /* ====== 移植：定数（Arduino相当） ====== */
 #define TIMER_INTERVAL   1    // ms
 #define PW_MIN           16
@@ -83,6 +99,42 @@ typedef enum {
   QS_SET   = 1,
   QS_RESET = 2
 } QaState;
+
+//音量調整用========================================
+bool IsMute=false;
+int cVolume=1;	//0-3
+int VolumeTbl[4]={127,64,32,0};
+
+void _SetCVolAll(uint8_t cv);
+
+void _SetVolume(){
+	int vol;
+	if(IsMute){
+		vol=VolumeTbl[0];
+	}else{
+		vol=VolumeTbl[cVolume];
+	}
+	_SetCVolAll(vol);
+}
+void VolumeUp(){
+	if(cVolume<3){
+		cVolume++;
+		_SetVolume();
+	}
+}
+
+void VolumeDown(){
+	if(cVolume>0){
+		cVolume--;
+		_SetVolume();
+	}
+}
+
+void ToggleMute(){
+	IsMute=!IsMute;
+	_SetVolume();
+}
+
 
 /* ====== GPIO ヘルパ（VP_PIN→VPIN, VM_PIN→VMIN, 4/5→IO0/IO1） ======
  *  ※ 以下のマクロは CubeMX が自動生成する main.h 由来のものを利用します。
@@ -157,7 +209,13 @@ static void MX_TIM14_Init(void);
 //=========================================================================
 // COMMAND Helper for DEBUG
 //=========================================================================
+
+#define CMD_VOL_UP		9
+#define CMD_VOL_DOWN	10
+#define CMD_MUTE		4
+
 const char *LastCmd=NULL;
+int LastCmdNo=-1;
 
 #ifdef CMD_DEBUG
 const char *cmdName[42]={
@@ -223,6 +281,8 @@ void delay_ms(unsigned int ms){
 //====================================================================
 // ADC関連
 //====================================================================
+
+
 int AdcRead(){
 	//Errorなら、-1
 	int val=-1;
@@ -329,6 +389,7 @@ static HAL_StatusTypeDef SOUND_SendAVOL(uint8_t av_code, uint32_t to_ms)
 }
 
 // CVOL（2B）: 1010 CH3 CH2 CH1 CH0, 0 CV1 CV0 CV6 CV5 CV4 CV3 CV2
+#if 0
 static HAL_StatusTypeDef SOUND_SendCVOL(uint8_t ch, uint8_t vol7, uint32_t to_ms)
 {
     if (ch > 3) return HAL_ERROR;
@@ -337,7 +398,26 @@ static HAL_StatusTypeDef SOUND_SendCVOL(uint8_t ch, uint8_t vol7, uint32_t to_ms
     const uint8_t tx[2] = { b1, b2 };
     return SOUND_Tx(tx, 2, to_ms);
 }
+#else
+static HAL_StatusTypeDef SOUND_SendCVOL(uint8_t ch, uint8_t vol7, uint32_t to_ms)
+{
+    if (ch > 3) return HAL_ERROR;
 
+    const uint8_t b1 = (uint8_t)(0xA0 | (1u << (ch & 0x03)));
+
+    vol7 &= 0x7F;
+
+    // 2バイト目: 0 CV1 CV0 CV6 CV5 CV4 CV3 CV2
+    const uint8_t b2 =
+        (uint8_t)(
+            ((vol7 & 0x03u) << 5) |   // CV1,CV0 -> bit6,5
+            ((vol7 & 0x7Cu) >> 2)     // CV6..CV2 -> bit4..0
+        );
+
+    const uint8_t tx[2] = { b1, b2 };
+    return SOUND_Tx(tx, 2, to_ms);
+}
+#endif
 // PLAY（2B）: [0100 F9 F8 C1 C0], [F7..F0]（0..1023）
 static HAL_StatusTypeDef SOUND_SendPLAY(uint8_t ch, uint16_t phrase, uint32_t to_ms)
 {
@@ -362,6 +442,7 @@ static HAL_StatusTypeDef SOUND_SendSTOP(uint8_t ch, uint32_t to_ms)
 }
 
 // ==== 公開API ====
+void     StopAll();
 
 // 初期化：PUP → AMODE(Class-D/BTL) → AVOL(0dB) → CVOL(全CH=0dB)
 HAL_StatusTypeDef SoundInit(void)
@@ -372,6 +453,8 @@ HAL_StatusTypeDef SoundInit(void)
     // 1) PUP
     st = SOUND_SendPUP(SOUND_SPI_TIMEOUT_MS);
     if (st != HAL_OK) return st;
+
+    StopAll();
 
     // 2) AMODE
 #if (SOUND_USE_CLASS_D)
@@ -471,7 +554,7 @@ void StopAll(void)   { for (uint8_t ch=0; ch<4; ch++) (void)SOUND_SendSTOP(ch, 5
 
 static inline uint8_t map255_to_cvol(uint8_t ui)
 {
-    uint16_t t = (uint16_t)ui * 0x7Fu + 127u/2u;
+	uint16_t t = (uint16_t)ui * 0x7Fu + 127u/2u;
     return (uint8_t)(0x7F - (t / 255u));
 }
 
@@ -498,6 +581,13 @@ void SetCVolAll(uint8_t vol0_255)
     uint8_t cv = map255_to_cvol(vol0_255);
     for (uint8_t ch=0; ch<4; ch++) (void)SOUND_SendCVOL(ch, cv, 50);
 }
+
+void _SetCVolAll(uint8_t cv)
+{
+    for (uint8_t ch=0; ch<4; ch++) (void)SOUND_SendCVOL(ch, cv, 50);
+}
+
+
 void SetAVol(uint8_t vol0_255)
 {
     uint8_t code = map255_to_avol_code(vol0_255);
@@ -697,10 +787,11 @@ static void QA_Task(void)
   if(cmdNo>=0){
     printf("%s(%04X)\n",cmdName[cmdNo],(unsigned)cmd);
     LastCmd=cmdName[cmdNo];
-
+    LastCmdNo=cmdNo;
   }else{
       printf("CMD: 0x%04X\n", (unsigned)cmd);
       LastCmd=NULL;
+      LastCmdNo=-1;
 }
 
 #else
@@ -864,7 +955,7 @@ static HAL_StatusTypeDef SOUND_SendCLOOP(uint8_t ch)
 
 // ==== 公開API ====
 // 通常再生
-HAL_StatusTypeDef LoopPlayOn(int ch, int phrase)
+HAL_StatusTypeDef StdPlayOn(int ch, int phrase)
 {
     if (!in_range_int(ch, 0, 3) || !in_range_int(phrase, 0, 1023)) {
         return HAL_ERROR;
@@ -923,7 +1014,7 @@ int main(void)
 {
 
   /* USER CODE BEGIN 1 */
-
+	int LastState;
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
@@ -960,6 +1051,7 @@ int main(void)
 
    SOUND_CS_H();
    delay_ms(100);
+   LastState=-1;
 
 
    //SPI1_SanityTest();
@@ -970,9 +1062,10 @@ int main(void)
    SoundInit();
    //Sound_PlayLikeTool();
    // 初期化直後の推奨設定
-	SetAVol(255);          // 全体=最大
-	SetCVolAll(255);       // 各ch=最大
+//	SetAVol(255);          // 全体=最大
+//	SetCVolAll(255);       // 各ch=最大
 
+#if 0
 	// AとBを同時発音
 	PlayOn(0, 0);          // CH0 ← フレーズ0
 	PlayOn(1, 1);          // CH1 ← フレーズ1
@@ -989,15 +1082,20 @@ int main(void)
 	// 初期化直後の推奨設定
 	SetAVol(255);          // 全体=最大
 	SetCVolAll(255);       // 各ch=最大
-
+#else
+	_SetVolume();
+	//LoopOn(0, 1);
+#endif
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-	  int KeyNo;
+	  //int KeyNo;
+	  char *State[4]={"Idle State","Start State","Run State","StopState"};
 	  QA_Task(); // Arduino の loop 相当：受信コマンドをprintfで出力
+#if 0
 	  if(LastCmd!=NULL){
 		  KeyNo=atoi(LastCmd)-1;
 		  LastCmd=NULL;
@@ -1013,6 +1111,27 @@ int main(void)
 			  	}
 		  }
 	  }
+#else
+	  	switch(LastCmdNo){
+	  	case CMD_VOL_UP:
+	  		VolumeUp();
+	  		printf("Volume Up(%d)\n",cVolume);
+	  		break;
+	  	case CMD_VOL_DOWN:
+			VolumeDown();
+			printf("Volume Down(%d)\n",cVolume);
+			break;
+	  	case CMD_MUTE:
+	  		ToggleMute();
+	  		if(IsMute){
+	  			printf("Mute On\n");
+	  		}else{
+	  			printf("Mute Off\n");
+	  		}
+	  	}
+	  	LastCmdNo=-1;
+#endif
+
 	  //TailLampの処理==============================================
 	  SetTailLED(IsNormalDir);
 
@@ -1024,8 +1143,47 @@ int main(void)
 	        int val = AdcRead();
 	        if(val>=0){
 	        	PowerMV=GetPower_mV(val);
+#ifdef POWER_CHECK_MODE
+	        	printf("Power=%dmV\n",PowerMV);
+#endif
 	        }
 	    }
+    	switch(PowerState){
+    	case powerIdle:
+    		if(PowerMV>=POWER_ON_TH){
+    			StdPlayOn(0,0);
+    			PowerState=powerStart;
+    		}
+    		break;
+    	case powerStart:
+    	    if(!IsPlaying(0)){
+    	    	LoopOn(0, 1);
+    			PowerState=powerON;
+    	    }
+    		break;
+    	case powerON:
+    		if(PowerMV<=POWER_OFF_TH){
+    			StopAll();
+    			StdPlayOn(0,2);
+    			PowerState=powerStop;
+    		}
+    		break;
+
+    	case powerStop:
+    	    if(!IsPlaying(0)){
+    			PowerState=powerIdle;
+    	    }
+    		if(PowerMV>=POWER_ON_TH){
+    			StdPlayOn(0,0);
+    			PowerState=powerStart;
+    		}
+    		break;
+    	}
+  	  if(LastState!=PowerState){
+  		  printf("State=%s,Power=%dmV\n",State[PowerState],PowerMV);
+  		  LastState=PowerState;
+  	  }
+
 
     /* USER CODE END WHILE */
 
