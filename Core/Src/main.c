@@ -1160,6 +1160,12 @@ int main(void)
     	    	LoopOn(0, 1);
     			PowerState=powerON;
     	    }
+    		if(PowerMV<=POWER_OFF_TH){
+    			StopAll();
+    			StdPlayOn(0,2);
+    			PowerState=powerStop;
+    		}
+    		break;
     		break;
     	case powerON:
     		if(PowerMV<=POWER_OFF_TH){
@@ -1174,6 +1180,7 @@ int main(void)
     			PowerState=powerIdle;
     	    }
     		if(PowerMV>=POWER_ON_TH){
+    			StopAll();
     			StdPlayOn(0,0);
     			PowerState=powerStart;
     		}
