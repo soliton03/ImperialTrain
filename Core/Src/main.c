@@ -101,23 +101,26 @@ typedef enum {
 } QaState;
 
 //音量調整用========================================
+/* 旧4段階: OFF(127), 小(64), 中(32), 大(0) — CVOL 生値
+ * 現在3段階: 小・中・大のみ（OFF相当は段階に含めない）。起動時は大(2)。
+ * MUTE 時のみ旧 OFF と同じ 127 を適用。 */
 bool IsMute=false;
-int cVolume=1;	//0-3
-int VolumeTbl[4]={127,64,32,0};
+int cVolume=2;
+static const int VolumeTbl[3]={64,32,0};
 
 void _SetCVolAll(uint8_t cv);
 
 void _SetVolume(){
 	int vol;
 	if(IsMute){
-		vol=VolumeTbl[0];
+		vol=127;
 	}else{
 		vol=VolumeTbl[cVolume];
 	}
-	_SetCVolAll(vol);
+	_SetCVolAll((uint8_t)vol);
 }
 void VolumeUp(){
-	if(cVolume<3){
+	if(cVolume<2){
 		cVolume++;
 		_SetVolume();
 	}
@@ -817,7 +820,10 @@ static void QA_Init(void)
   // 状態初期化
   lVM = digitalRead_VM();
   VM = lVM;
-  LastState  = QS_IDLE;
+  /* QS_IDLE のままだと 1ms ティック最初の「擬似エッジ」(QS_IDLE→SET/RESET) で CmdMode が true になり、
+   * 状態が安定しているだけで約 PW_WHISTLE ms 後に汽笛(ホイッスル)が誤発火する。
+   * 現在の VM と同じ QS を LastState に入れておけば、実際の極性変化までエッジにならない。 */
+  LastState = VM ? QS_RESET : QS_SET;
   PulseWidth = 0;
   CmdMode    = false;
   IsWhistle  = false;
@@ -1084,7 +1090,7 @@ int main(void)
 	SetCVolAll(255);       // 各ch=最大
 #else
 	_SetVolume();
-	//LoopOn(0, 1);
+	//LoopOn(0, 0);  /* ループ音はフレーズ0（電源状態機械と同じ） */
 #endif
   /* USER CODE END 2 */
 
@@ -1148,21 +1154,22 @@ int main(void)
 #endif
 	        }
 	    }
+    	/* 電源連動: 起動音=フレーズ1、ループ音=フレーズ0（停止音フレーズは未使用・コメントアウト） */
     	switch(PowerState){
     	case powerIdle:
     		if(PowerMV>=POWER_ON_TH){
-    			StdPlayOn(0,0);
+    			StdPlayOn(0, 1);  /* 起動音: フレーズ1 */
     			PowerState=powerStart;
     		}
     		break;
     	case powerStart:
     	    if(!IsPlaying(0)){
-    	    	LoopOn(0, 1);
+    	    	LoopOn(0, 0);  /* ループ音: フレーズ0（起動音終了後） */
     			PowerState=powerON;
     	    }
     		if(PowerMV<=POWER_OFF_TH){
     			StopAll();
-    			StdPlayOn(0,2);
+    			// StdPlayOn(0, 2);  /* 停止音フレーズ — 仕様上なしのため再生しない */
     			PowerState=powerStop;
     		}
     		break;
@@ -1170,7 +1177,7 @@ int main(void)
     	case powerON:
     		if(PowerMV<=POWER_OFF_TH){
     			StopAll();
-    			StdPlayOn(0,2);
+    			// StdPlayOn(0, 2);  /* 停止音フレーズ — 仕様上なしのため再生しない */
     			PowerState=powerStop;
     		}
     		break;
@@ -1181,7 +1188,7 @@ int main(void)
     	    }
     		if(PowerMV>=POWER_ON_TH){
     			StopAll();
-    			StdPlayOn(0,0);
+    			StdPlayOn(0, 1);  /* 再投入時の起動音: フレーズ1（powerIdle 遷移時と同じ） */
     			PowerState=powerStart;
     		}
     		break;
