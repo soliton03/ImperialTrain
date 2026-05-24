@@ -89,10 +89,10 @@ int PowerState=powerIdle;
 #define OFF	0
 
 //極性判定回路用==========================
-#define DIR_CHK_CNT	100		//100ms安定で判定
-int IsNormalDir=true;		//falseなら尾灯は不点灯
-int CurrentDir=true;		//Trueなら進行方向
-int DirCount=DIR_CHK_CNT;
+/* VMがPW_LONG(72ms)超えて同一→極性確定。Quantum半ビット(最大72ms)は無視 */
+volatile int IsNormalDir=true;	//true=進行方向, false=逆方向(尾灯点灯)
+static volatile uint8_t DirLastVM=0;
+static volatile uint16_t DirHoldMs=0;
 
 typedef enum {
   QS_IDLE  = 0,
@@ -155,8 +155,20 @@ static inline int digitalRead_VM(void){
 static inline void digitalWrite_IO0(int level){
   HAL_GPIO_WritePin(IO0_GPIO_Port, IO0_Pin, level ? GPIO_PIN_SET : GPIO_PIN_RESET);
 }
-static inline void SetTailLED(int level){
-  HAL_GPIO_WritePin(nTailLED_GPIO_Port, nTailLED_Pin, level ? GPIO_PIN_RESET : GPIO_PIN_SET);
+/* isNormalDir: true=進行方向(消灯), false=逆方向(点灯). nTailLEDはActive-L */
+static inline void SetTailLED(int isNormalDir){
+  static int lastIsNormalDir = -1;
+
+  HAL_GPIO_WritePin(nTailLED_GPIO_Port, nTailLED_Pin,
+                    isNormalDir ? GPIO_PIN_SET : GPIO_PIN_RESET);
+  if (lastIsNormalDir != isNormalDir) {
+    lastIsNormalDir = isNormalDir;
+    if (isNormalDir) {
+      printf("TailLED OFF (NormalDir)\n");
+    } else {
+      printf("TailLED ON (ReverseDir)\n");
+    }
+  }
 }
 
 static inline void digitalWrite_IO2(int level){
@@ -692,19 +704,18 @@ static void QA_1msTick(void)
   if (cVM == lVM) { VM = (uint8_t)cVM; }
   lVM = (uint8_t)cVM;
   // ==================================
-  //方向判定============================
-  if(cVM!=CurrentDir){
-	  //極性が変化
-	  DirCount=DIR_CHK_CNT;
-  }else{
-	  if(DirCount>0){
-		  DirCount--;
-		  if(DirCount==0){
-			  IsNormalDir=CurrentDir;
-		  }
-	  }
+  // 方向判定: VMがPW_LONG超えて同一なら極性確定（Quantum半ビットは最大72msのため無視）
+  if (cVM == (int)DirLastVM) {
+    if (DirHoldMs < 0xFFFFu) {
+      DirHoldMs++;
+    }
+    if (DirHoldMs > PW_LONG) {
+      IsNormalDir = (cVM != 0);
+    }
+  } else {
+    DirLastVM = (uint8_t)cVM;
+    DirHoldMs = 0;
   }
-  CurrentDir=cVM;
 
   // VM から状態判定
   if(VM){
@@ -815,11 +826,13 @@ static void QA_Init(void)
   // 出力初期化（IO0/IO1 は CubeMX 側で Output 設定済み前提）
   digitalWrite_IO0(0);
   //digitalWrite_IO1(0);
-  SetTailLED(OFF);
-
   // 状態初期化
   lVM = digitalRead_VM();
   VM = lVM;
+  DirLastVM = lVM;
+  DirHoldMs = 0;
+  IsNormalDir = true;
+  SetTailLED(IsNormalDir);
   /* QS_IDLE のままだと 1ms ティック最初の「擬似エッジ」(QS_IDLE→SET/RESET) で CmdMode が true になり、
    * 状態が安定しているだけで約 PW_WHISTLE ms 後に汽笛(ホイッスル)が誤発火する。
    * 現在の VM と同じ QS を LastState に入れておけば、実際の極性変化までエッジにならない。 */
