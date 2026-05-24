@@ -26,6 +26,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include "fw_build.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -40,7 +41,8 @@
 
 /* Private macro -------------------------------------------------------------*/
 /* USER CODE BEGIN PM */
-#define CMD_DEBUG
+//#define QA_RX_TRACE   /* [pop/skip/pair/drop/deb 018 m=0 v=2] 形式の診断ログ */
+//#define CMD_DEBUG
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
@@ -69,6 +71,11 @@ enum enPowerState{
 };
 
 int PowerState=powerIdle;
+static int LastPowerState=-1;
+
+static const char * const PowerStateName[]={
+	"Idle State","Start State","Run State","StopState"
+};
 
 
 /* ====== 移植：定数（Arduino相当） ====== */
@@ -104,15 +111,23 @@ typedef enum {
 /* 旧4段階: OFF(127), 小(64), 中(32), 大(0) — CVOL 生値
  * 現在3段階: 小・中・大のみ（OFF相当は段階に含めない）。起動時は大(2)。
  * MUTE 時のみ旧 OFF と同じ 127 を適用。 */
-bool IsMute=false;
+static uint8_t IsMuted = 0;
 int cVolume=2;
 static const int VolumeTbl[3]={64,32,0};
+static uint32_t VolUpGuardUntil = 0;
 
 void _SetCVolAll(uint8_t cv);
+void _SetVolume(void);
+
+static void SetMute(uint8_t muteOn)
+{
+  IsMuted = muteOn ? 1u : 0u;
+  _SetVolume();
+}
 
 void _SetVolume(){
 	int vol;
-	if(IsMute){
+	if(IsMuted != 0){
 		vol=127;
 	}else{
 		vol=VolumeTbl[cVolume];
@@ -122,19 +137,14 @@ void _SetVolume(){
 void VolumeUp(){
 	if(cVolume<2){
 		cVolume++;
-		_SetVolume();
 	}
+	_SetVolume();
 }
 
 void VolumeDown(){
 	if(cVolume>0){
 		cVolume--;
-		_SetVolume();
 	}
-}
-
-void ToggleMute(){
-	IsMute=!IsMute;
 	_SetVolume();
 }
 
@@ -157,18 +167,8 @@ static inline void digitalWrite_IO0(int level){
 }
 /* isNormalDir: true=進行方向(消灯), false=逆方向(点灯). nTailLEDはActive-L */
 static inline void SetTailLED(int isNormalDir){
-  static int lastIsNormalDir = -1;
-
   HAL_GPIO_WritePin(nTailLED_GPIO_Port, nTailLED_Pin,
                     isNormalDir ? GPIO_PIN_SET : GPIO_PIN_RESET);
-  if (lastIsNormalDir != isNormalDir) {
-    lastIsNormalDir = isNormalDir;
-    if (isNormalDir) {
-      printf("TailLED OFF (NormalDir)\n");
-    } else {
-      printf("TailLED ON (ReverseDir)\n");
-    }
-  }
 }
 
 static inline void digitalWrite_IO2(int level){
@@ -187,6 +187,11 @@ static inline int cmdq_pop(void){
   if (cmdq_is_empty()) return -1;
   int v = cmdq[q_tail]; q_tail = (uint8_t)(q_tail + 1); return v;
 }
+static inline int cmdq_peek(void)
+{
+  if (cmdq_is_empty()) return -1;
+  return cmdq[q_tail];
+}
 
 /* ====== 変数（Arduinoスケッチ由来） ====== */
 static volatile uint8_t  lVM = 0; // 直近サンプル
@@ -194,15 +199,23 @@ static volatile uint8_t  VM  = 0; // ノイズキャンセル後
 static volatile int      LastState   = QS_IDLE;	//実際には存在しないが便宜上入れておく
 static volatile uint16_t PulseWidth  = 0;
 static volatile bool     CmdMode     = false;
+static volatile bool     CmdFrameArmed = false;
 static volatile bool     IsWhistle   = false;
+static volatile uint8_t  CmdQuietVM  = 0;
+static volatile uint16_t CmdQuietCnt = 0;
+static volatile uint16_t CmdFrameIdleMs = 0;
 static volatile uint16_t cCmd        = 0;
 static volatile uint8_t  cbitCnt     = 0;
 static volatile uint8_t  nextBitLen  = CBITLEN;
+static volatile uint32_t CmdSuppressUntil = 0;
 
 /* ====== プロトタイプ ====== */
 static void QA_Init(void);
 static void QA_1msTick(void);
 static void QA_Task(void);
+static inline void QA_ResetCmdFrame(void);
+static void QA_SuppressRx(uint32_t ms);
+static void QA_HandleCmd(int cmd);
 
 /* USER CODE END PV */
 
@@ -228,6 +241,80 @@ static void MX_TIM14_Init(void);
 #define CMD_VOL_UP		9
 #define CMD_VOL_DOWN	10
 #define CMD_MUTE		4
+
+/* Quantum受信: 音量・ミュートのみ実行 */
+#define QA_CMD_MUTE      0x018u
+#define QA_CMD_MUTE_STAR 0x01bu
+#define QA_CMD_VOL_UP    0x041u
+#define QA_CMD_VOL_DOWN  0x044u
+#define CMD_DEBOUNCE_MS  200u
+#define MUTE_DEBOUNCE_MS 800u
+#define VOLUP_GUARD_MS   250u  /* VolUp押下後の044(解放)をVolDownと誤認しない */
+#define CMD_FRAME_IDLE_MS 100u  /* ビット途中で途切れたフレームを破棄 */
+#define CMD_RX_SUPPRESS_MS 800u /* ユーザー操作後の誤受信抑止 */
+#define CMD_RX_SUPPRESS_BAD_MS 1000u /* 非ユーザーcmd受信後の抑止 */
+
+#ifdef QA_RX_TRACE
+static void QA_Trace(const char *tag, uint16_t cmd)
+{
+  printf("[%s %03X m=%u v=%d]\n", tag, (unsigned)cmd,
+         (unsigned)((IsMuted != 0u) ? 1u : 0u), cVolume);
+}
+#else
+static void QA_Trace(const char *tag, uint16_t cmd)
+{
+  (void)tag;
+  (void)cmd;
+}
+#endif
+
+/* Quantum: 押下=code, 解放=code+3。VolUp解放(044)はVolDownと同コードのためペア化 */
+static int QA_PopFiltered(void)
+{
+  int cmd;
+  uint16_t ucmd;
+  int next;
+
+  for (;;) {
+    cmd = cmdq_pop();
+    if (cmd < 0) {
+      return -1;
+    }
+    ucmd = (uint16_t)cmd;
+
+    if (ucmd == QA_CMD_MUTE_STAR) {
+      QA_Trace("skip", ucmd);
+      continue;
+    }
+
+    next = cmdq_peek();
+    if (ucmd == QA_CMD_VOL_UP && next == (int)QA_CMD_VOL_DOWN) {
+      (void)cmdq_pop();
+      QA_Trace("pair", ucmd);
+    }
+
+    if (ucmd == QA_CMD_VOL_UP || ucmd == QA_CMD_VOL_DOWN || ucmd == QA_CMD_MUTE) {
+      while (!cmdq_is_empty() && (uint16_t)cmdq_peek() == (int)ucmd) {
+        (void)cmdq_pop();
+      }
+    }
+
+    QA_Trace("pop", ucmd);
+    return cmd;
+  }
+}
+
+static bool QA_IsUserCmd(uint16_t cmd)
+{
+  switch (cmd) {
+  case QA_CMD_MUTE:
+  case QA_CMD_VOL_UP:
+  case QA_CMD_VOL_DOWN:
+    return true;
+  default:
+    return false;
+  }
+}
 
 const char *LastCmd=NULL;
 int LastCmdNo=-1;
@@ -631,17 +718,18 @@ HAL_StatusTypeDef SetVolume(int ch, uint8_t vol7)
 //====================================================================
 // printfサポート
 //====================================================================
-/* UART送信(DMA)によるprintf対応 */
+/* UART送信（ブロッキング）によるprintf対応
+ * DMA版は連続printf時にHAL/DMA割込と競合しHardFaultの原因になるため不使用 */
 int _write(int file, char *ptr, int len)
 {
-    // DMAが動作中なら待つ
-    while (huart1.gState != HAL_UART_STATE_READY) { }
+    uint16_t tx_len;
 
-    HAL_UART_Transmit_DMA(&huart1, (uint8_t*)ptr, len);
-
-    // 完了待ち
-    while (huart1.gState != HAL_UART_STATE_READY) { }
-
+    (void)file;
+    if (len <= 0) {
+        return 0;
+    }
+    tx_len = (len > 65535) ? 65535u : (uint16_t)len;
+    (void)HAL_UART_Transmit(&huart1, (const uint8_t *)ptr, tx_len, HAL_MAX_DELAY);
     return len;
 }
 
@@ -693,17 +781,80 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
     }
 }
 
+static inline void QA_ResetCmdFrame(void)
+{
+  cCmd = 0;
+  cbitCnt = 0;
+  CmdMode = false;
+  CmdFrameArmed = false;
+  CmdFrameIdleMs = 0;
+  nextBitLen = CBITLEN;
+}
+
+static inline bool QA_RxAllowed(void)
+{
+  return (int32_t)(HAL_GetTick() - CmdSuppressUntil) >= 0;
+}
+
+static void QA_SuppressRx(uint32_t ms)
+{
+  int dropped = 0;
+
+  CmdSuppressUntil = HAL_GetTick() + ms;
+  QA_ResetCmdFrame();
+  while (cmdq_pop() >= 0) {
+    dropped++;
+  }
+#ifdef QA_RX_TRACE
+  if (dropped > 0) {
+    printf("[drop %d]\n", dropped);
+  }
+#else
+  (void)dropped;
+#endif
+}
+
 static void QA_1msTick(void)
 {
   // TIMER_INTERVAL ms毎にここが呼び出される
   int cVM;
   int cState;
+  bool validBit;
+  bool validBell;
 
   // Noise Cancel =====================
   cVM = digitalRead_VM(); // VM_PIN → VMIN
   if (cVM == lVM) { VM = (uint8_t)cVM; }
   lVM = (uint8_t)cVM;
   // ==================================
+  // コマンド待受: VMがPW_LONG超えて安定したらフレーム受付可能
+  if (VM == CmdQuietVM) {
+    if (CmdQuietCnt < 0xFFFFu) {
+      CmdQuietCnt++;
+    }
+    if (CmdQuietCnt > PW_LONG) {
+      if (!CmdMode && QA_RxAllowed()) {
+        CmdFrameArmed = true;
+      } else if (cbitCnt == 0) {
+        /* 受信開始のみでビット未確定のまま静止 → 誤開始を解除 */
+        CmdMode = false;
+        CmdFrameArmed = true;
+      }
+    }
+  } else {
+    CmdQuietVM = VM;
+    CmdQuietCnt = 0;
+  }
+  if (CmdMode && cbitCnt > 0) {
+    if (CmdFrameIdleMs < 0xFFFFu) {
+      CmdFrameIdleMs++;
+    }
+    if (CmdFrameIdleMs > CMD_FRAME_IDLE_MS) {
+      QA_ResetCmdFrame();
+    }
+  } else {
+    CmdFrameIdleMs = 0;
+  }
   // 方向判定: VMがPW_LONG超えて同一なら極性確定（Quantum半ビットは最大72msのため無視）
   if (cVM == (int)DirLastVM) {
     if (DirHoldMs < 0xFFFFu) {
@@ -731,38 +882,68 @@ static void QA_1msTick(void)
   digitalWrite_IO2(cState-1);
 
   if (cState != LastState) {
-    // 状態が変化
-    CmdMode = true;
+    CmdFrameIdleMs = 0;
+    validBit = (PulseWidth >= PW_MIN) && (PulseWidth <= PW_LONG);
+    validBell = (PulseWidth >= PW_BELL_MIN) && (PulseWidth <= PW_BELL_MAX);
 
-    // 汽笛が鳴っていれば停止
+    // 汽笛が鳴っていれば停止（キューには載せない）
     if (IsWhistle) {
       IsWhistle = false;
-      cmdq_push_isr(CMD_WHISTLE_OFF);
-      CmdMode = false;
+      QA_ResetCmdFrame();
     }
 
-    // パルス幅でデコード
-    if ((PulseWidth >= PW_MIN) && (PulseWidth <= PW_LONG)) {
-      int bit = (PulseWidth < PW_CHK) ? 0 : 1;
-      digitalWrite_IO2(bit);
-      cCmd = (uint16_t)((cCmd << 1) + (uint16_t)bit);
-      cbitCnt++;
-      if (cbitCnt >= nextBitLen) {
-        cmdq_push_isr((int)cCmd);
-        if (cCmd == 0x30) {
-          nextBitLen = CBITLEN + 1;
-        } else {
+    if (!QA_RxAllowed()) {
+      PulseWidth = 0;
+      LastState  = cState;
+      return;
+    }
+
+    if (CmdMode || CmdFrameArmed) {
+      if (!CmdMode) {
+        /* 待受中の先頭エッジ: 旧Arduino同様CmdModeのみ開始（PulseWidthは次エッジで有効） */
+        CmdMode = true;
+        CmdFrameArmed = false;
+      } else if (validBit) {
+        int bit = (PulseWidth < PW_CHK) ? 0 : 1;
+        digitalWrite_IO2(bit);
+        cCmd = (uint16_t)((cCmd << 1) + (uint16_t)bit);
+        cbitCnt++;
+        if (cbitCnt >= nextBitLen) {
+          uint16_t rxCmd = cCmd;
+          /* MUTE*(01b)はボタン解放パルス。キューに載せない */
+          if (rxCmd == QA_CMD_MUTE_STAR) {
+            cbitCnt = 0;
+            cCmd = 0;
+            nextBitLen = CBITLEN;
+            CmdMode = false;
+            CmdFrameArmed = false;
+            PulseWidth = 0;
+            LastState  = cState;
+            return;
+          }
+          if (QA_IsUserCmd(rxCmd)) {
+            cmdq_push_isr((int)rxCmd);
+          } else {
+            CmdSuppressUntil = HAL_GetTick() + CMD_RX_SUPPRESS_BAD_MS;
+            QA_ResetCmdFrame();
+            PulseWidth = 0;
+            LastState  = cState;
+            return;
+          }
+          cbitCnt = 0;
+          cCmd = 0;
           nextBitLen = CBITLEN;
           CmdMode = false;
+          CmdFrameArmed = false;
         }
-        cbitCnt = 0;
-        cCmd = 0;
+      } else if (validBell) {
+        /* ベル等ユーザー未使用コマンドは無視 */
+        CmdSuppressUntil = HAL_GetTick() + CMD_RX_SUPPRESS_BAD_MS;
+        QA_ResetCmdFrame();
+      } else if (cbitCnt > 0) {
+        /* ビット途中で幅不正 → フレーム破棄 */
+        QA_ResetCmdFrame();
       }
-    } else if ((PulseWidth >= PW_BELL_MIN) && (PulseWidth <= PW_BELL_MAX)) {
-      cmdq_push_isr(CMD_BELL);
-      cbitCnt = 0;
-      cCmd = 0;
-      CmdMode = false;
     }
 
     // 反転からカウント再開
@@ -779,46 +960,103 @@ static void QA_1msTick(void)
     if (PulseWidth <= PW_WHISTLE) {
       PulseWidth++;
     } else {
-      // 汽笛ON（コマンド中のみ）
+      // 汽笛ローカル表示のみ（キューには載せない）
       if (CmdMode && (!IsWhistle)) {
         IsWhistle = true;
-        cmdq_push_isr(CMD_WHISTLE_ON);
       }
     }
     LastState = cState;
   }
 }
 
-/* ====== メインループ側：キューを吐き出す（Serial→printf） ====== */
-static void QA_Task(void)
+/* ====== メインループ側：キューを吐き出して処理 ====== */
+static void QA_HandleCmd(int cmd)
 {
-  int cmd = cmdq_pop();
+  static uint32_t lastActTick = 0;
+  static uint16_t lastActCmd = 0;
+  static uint32_t lastMuteTick = 0;
+  uint32_t now = HAL_GetTick();
+  uint16_t ucmd = (uint16_t)cmd;
+  uint8_t wasMuted;
 
-  if (cmd < 0) return;
-#ifdef CMD_DEBUG
-  int cmdNo;
-  cmdNo=GetCmdNo(cmd);
-  if(cmdNo>=0){
-    printf("%s(%04X)\n",cmdName[cmdNo],(unsigned)cmd);
-    LastCmd=cmdName[cmdNo];
-    LastCmdNo=cmdNo;
-  }else{
-      printf("CMD: 0x%04X\n", (unsigned)cmd);
-      LastCmd=NULL;
-      LastCmdNo=-1;
+  /* 破損値(24等)を 0/1 に正規化。非0はミュート中 */
+  IsMuted = (IsMuted != 0u) ? 1u : 0u;
+
+  switch (ucmd) {
+  case QA_CMD_VOL_UP:
+  case QA_CMD_VOL_DOWN:
+    if (lastActCmd == ucmd && (now - lastActTick) < CMD_DEBOUNCE_MS) {
+      QA_Trace("deb", ucmd);
+      return;
+    }
+    lastActCmd = ucmd;
+    lastActTick = now;
+    break;
+  case QA_CMD_MUTE:
+    if ((now - lastMuteTick) < MUTE_DEBOUNCE_MS) {
+      QA_Trace("deb", ucmd);
+      return;
+    }
+    lastMuteTick = now;
+    break;
+  default:
+    return;
+  }
+
+  switch (ucmd) {
+  case QA_CMD_VOL_UP:
+    VolumeUp();
+    VolUpGuardUntil = now + VOLUP_GUARD_MS;
+    printf("Volume Up\n");
+    QA_SuppressRx(CMD_RX_SUPPRESS_MS);
+    break;
+  case QA_CMD_VOL_DOWN:
+    if ((int32_t)(now - VolUpGuardUntil) < 0) {
+      QA_Trace("rel", ucmd);
+      QA_SuppressRx(CMD_RX_SUPPRESS_MS);
+      break;
+    }
+    VolumeDown();
+    printf("Volume Down\n");
+    QA_SuppressRx(CMD_RX_SUPPRESS_MS);
+    break;
+  case QA_CMD_MUTE:
+    wasMuted = IsMuted;
+    if (wasMuted) {
+      SetMute(0);
+      printf("Mute OFF\n");
+    } else {
+      SetMute(1);
+      printf("Mute ON\n");
+    }
+    QA_SuppressRx(CMD_RX_SUPPRESS_MS);
+    break;
+  default:
+    break;
+  }
 }
 
-#else
-  switch (cmd) {
-    case CMD_WHISTLE_ON:  printf("WHISTLE ON\r\n");  break;
-    case CMD_WHISTLE_OFF: printf("WHISTLE OFF\r\n"); break;
-    case CMD_BELL:        printf("BELL\r\n");        break;
-    default:
-      // 受信コマンド（11/12bit想定）をそのまま表示
-      printf("CMD: 0x%04X\r\n", (unsigned)cmd);
-      break;
+static void QA_Task(void)
+{
+  int cmd;
+
+  cmd = QA_PopFiltered();
+  if (cmd < 0) {
+    return;
+  }
+#if 0 /* CMD_DEBUG: コマンド名・番号表示 */
+  int cmdNo = GetCmdNo((uint16_t)cmd);
+  if (cmdNo >= 0) {
+    printf("%s(%04X)\n", cmdName[cmdNo], (unsigned)cmd);
+    LastCmd = cmdName[cmdNo];
+    LastCmdNo = cmdNo;
+  } else {
+    printf("CMD: 0x%04X\n", (unsigned)cmd);
+    LastCmd = NULL;
+    LastCmdNo = -1;
   }
 #endif
+  QA_HandleCmd(cmd);
 }
 
 static void QA_Init(void)
@@ -838,14 +1076,10 @@ static void QA_Init(void)
    * 現在の VM と同じ QS を LastState に入れておけば、実際の極性変化までエッジにならない。 */
   LastState = VM ? QS_RESET : QS_SET;
   PulseWidth = 0;
-  CmdMode    = false;
+  QA_ResetCmdFrame();
   IsWhistle  = false;
-  cCmd       = 0;
-  cbitCnt    = 0;
-  nextBitLen = CBITLEN;
-
-  // バナー（SerialPrint→printf 置換）
-  printf("QA Analyzer STM32C011F6, TIM14 %dms\n", TIMER_INTERVAL);
+  CmdQuietVM = VM;
+  CmdQuietCnt = 0;
 
   // TIM14 1ms 割り込み開始（CubeMXで 1kHz 設定済みを想定）
   HAL_TIM_Base_Start_IT(&htim14);
@@ -1033,7 +1267,7 @@ int main(void)
 {
 
   /* USER CODE BEGIN 1 */
-	int LastState;
+
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
@@ -1063,14 +1297,15 @@ int main(void)
   /* USER CODE BEGIN 2 */
   // 受信割り込み開始
    //UART2_Start_Receive_IT();
-   QA_Init();   // 初期化（UARTバナー、IO初期状態、TIM14割り込み開始）
    setvbuf(stdout, NULL, _IONBF, 0); // printfバッファ無効化
+   printf("%s Build %s\n", FW_PRODUCT_NAME, FW_BUILD_NUMBER);
+   QA_Init();   // 初期化（IO初期状態、TIM14割り込み開始）
    HAL_ADCEx_Calibration_Start(&hadc1);
    adc_tick = HAL_GetTick();
 
    SOUND_CS_H();
    delay_ms(100);
-   LastState=-1;
+   LastPowerState=-1;
 
 
    //SPI1_SanityTest();
@@ -1111,45 +1346,7 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-	  //int KeyNo;
-	  char *State[4]={"Idle State","Start State","Run State","StopState"};
-	  QA_Task(); // Arduino の loop 相当：受信コマンドをprintfで出力
-#if 0
-	  if(LastCmd!=NULL){
-		  KeyNo=atoi(LastCmd)-1;
-		  LastCmd=NULL;
-		  if((KeyNo>=0)&&(KeyNo<5)){
-			  	//StopAll();
-			  	StopOn(0);
-			  	if(KeyNo==1){
-			  		LoopOn(0, KeyNo);
-			  	}else{
-					//PlayOn(0, KeyNo);          // CH0 ← フレーズ0
-				  	LoopPlayOn(0, KeyNo);
-
-			  	}
-		  }
-	  }
-#else
-	  	switch(LastCmdNo){
-	  	case CMD_VOL_UP:
-	  		VolumeUp();
-	  		printf("Volume Up(%d)\n",cVolume);
-	  		break;
-	  	case CMD_VOL_DOWN:
-			VolumeDown();
-			printf("Volume Down(%d)\n",cVolume);
-			break;
-	  	case CMD_MUTE:
-	  		ToggleMute();
-	  		if(IsMute){
-	  			printf("Mute On\n");
-	  		}else{
-	  			printf("Mute Off\n");
-	  		}
-	  	}
-	  	LastCmdNo=-1;
-#endif
+	  QA_Task();
 
 	  //TailLampの処理==============================================
 	  SetTailLED(IsNormalDir);
@@ -1186,7 +1383,6 @@ int main(void)
     			PowerState=powerStop;
     		}
     		break;
-    		break;
     	case powerON:
     		if(PowerMV<=POWER_OFF_TH){
     			StopAll();
@@ -1206,10 +1402,16 @@ int main(void)
     		}
     		break;
     	}
-  	  if(LastState!=PowerState){
-  		  printf("State=%s,Power=%dmV\n",State[PowerState],PowerMV);
-  		  LastState=PowerState;
+#if 0
+  	  if(LastPowerState!=PowerState){
+  		  if((unsigned)PowerState <
+  		     (sizeof(PowerStateName)/sizeof(PowerStateName[0]))){
+  		  	printf("State=%s,Power=%dmV\n",
+  		  	       PowerStateName[PowerState],PowerMV);
+  		  }
+  		  LastPowerState=PowerState;
   	  }
+#endif
 
 
     /* USER CODE END WHILE */
