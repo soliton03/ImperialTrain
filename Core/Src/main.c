@@ -41,6 +41,7 @@
 
 /* Private macro -------------------------------------------------------------*/
 /* USER CODE BEGIN PM */
+#define SOUND_DEBUG     /* サウンド再生/停止/切替のUART診断 */
 //#define QA_RX_TRACE   /* [pop/skip/pair/drop/deb 018 m=0 v=2] 形式の診断ログ */
 //#define CMD_DEBUG
 /* USER CODE END PM */
@@ -63,8 +64,31 @@ DMA_HandleTypeDef hdma_usart1_tx;
 //=====================================
 //#define POWER_CHECK_MODE	//シリアルポートで電圧をチェック
 
-#define POWER_ON_TH		5300	//6.5Vを超えたとき
-#define POWER_OFF_TH	4700	//6.0Vを下回った時
+/* しきい値は ADC 読取電圧(mV)。実電圧はブリッジ等の降下分を含む。
+ * 校正: 実6.5V→5300, 実6.0V→4700 (GetPower_mV 換算値) */
+#define POWER_ON_TH		((5000 * 5300) / 6500)	/* 実5.0V超 ≒ 読取4076mV */
+#define POWER_OFF_TH	((4000 * 4700) / 6000)	/* 実4.0V未満 ≒ 読取3133mV */
+
+/* 音源フェーズ (CH0) */
+#define PHRASE_FAN_LOOP    0   /* お召列車ラジエータファンループ */
+#define PHRASE_RUN_LOOP    1   /* 走行音 */
+#define PHRASE_STARTUP     2   /* 起動音 */
+
+#define RUN_FAN_TEST_SHORT   /* テスト: 1分毎（本番はコメントアウトして5分） */
+#ifdef RUN_FAN_TEST_SHORT
+#define RUN_FAN_INTERVAL_MS  (1u * 60u * 1000u) /* テスト: 1分毎 */
+#else
+#define RUN_FAN_INTERVAL_MS  (5u * 60u * 1000u) /* 走行音5分毎 */
+#endif
+#define RUN_FAN_DURATION_MS  (30u * 1000u)     /* ラジエター音30秒 */
+
+typedef enum {
+  runMainLoop,
+  runFanLoop
+} RunSoundMode;
+
+static RunSoundMode RunSoundState = runMainLoop;
+static uint32_t RunModeSince = 0;
 
 enum enPowerState{
 	powerIdle,powerStart,powerON,powerStop
@@ -1257,6 +1281,87 @@ int IsPlaying(int ch)
     return RDSTAT_BUSYB(st, ch) ? 0 : 1;
 }
 
+#ifdef SOUND_DEBUG
+static const char *SoundPhraseName(int phrase)
+{
+  switch (phrase) {
+  case PHRASE_FAN_LOOP: return "RadiatorFan";
+  case PHRASE_RUN_LOOP: return "Run";
+  case PHRASE_STARTUP:  return "Startup";
+  default:              return "?";
+  }
+}
+
+static void SoundDbg_Play(int phrase)
+{
+  printf("Sound PLAY P%d (%s)\n", phrase, SoundPhraseName(phrase));
+}
+
+static void SoundDbg_Loop(int phrase)
+{
+  printf("Sound LOOP P%d (%s)\n", phrase, SoundPhraseName(phrase));
+}
+
+static void SoundDbg_Stop(const char *reason)
+{
+  printf("Sound STOP (%s)\n", reason);
+}
+#else
+static void SoundDbg_Play(int phrase)
+{
+  (void)phrase;
+}
+
+static void SoundDbg_Loop(int phrase)
+{
+  (void)phrase;
+}
+
+static void SoundDbg_Stop(const char *reason)
+{
+  (void)reason;
+}
+#endif
+
+static void RunSound_Reset(void)
+{
+  RunSoundState = runMainLoop;
+  RunModeSince = 0;
+}
+
+static void RunSound_StartMainLoop(void)
+{
+  SoundDbg_Loop(PHRASE_RUN_LOOP);
+  (void)LoopOn(0, PHRASE_RUN_LOOP);
+  RunSoundState = runMainLoop;
+  RunModeSince = HAL_GetTick();
+}
+
+/* powerON中: 5分毎に30秒ラジエター音(0)を挿入し走行音(1)へ復帰 */
+static void RunSound_Task(void)
+{
+  uint32_t now = HAL_GetTick();
+  uint32_t elapsed = now - RunModeSince;
+
+  if (RunSoundState == runMainLoop) {
+    if (elapsed >= RUN_FAN_INTERVAL_MS) {
+      SoundDbg_Stop("switch to fan");
+      SoundDbg_Loop(PHRASE_FAN_LOOP);
+      (void)StopOn(0);
+      (void)LoopOn(0, PHRASE_FAN_LOOP);
+      RunSoundState = runFanLoop;
+      RunModeSince = now;
+    }
+  } else if (elapsed >= RUN_FAN_DURATION_MS) {
+    SoundDbg_Stop("fan end");
+    SoundDbg_Loop(PHRASE_RUN_LOOP);
+    (void)StopOn(0);
+    (void)LoopOn(0, PHRASE_RUN_LOOP);
+    RunSoundState = runMainLoop;
+    RunModeSince = now;
+  }
+}
+
 /* USER CODE END 0 */
 
 /**
@@ -1338,7 +1443,7 @@ int main(void)
 	SetCVolAll(255);       // 各ch=最大
 #else
 	_SetVolume();
-	//LoopOn(0, 0);  /* ループ音はフレーズ0（電源状態機械と同じ） */
+	//LoopOn(0, PHRASE_RUN_LOOP);
 #endif
   /* USER CODE END 2 */
 
@@ -1364,40 +1469,49 @@ int main(void)
 #endif
 	        }
 	    }
-    	/* 電源連動: 起動音=フレーズ1、ループ音=フレーズ0（停止音フレーズは未使用・コメントアウト） */
+    	/* 電源連動: 起動音=フェーズ2、走行音=フェーズ1、ラジエター=フェーズ0 */
     	switch(PowerState){
     	case powerIdle:
     		if(PowerMV>=POWER_ON_TH){
-    			StdPlayOn(0, 1);  /* 起動音: フレーズ1 */
+    			SoundDbg_Play(PHRASE_STARTUP);
+    			StdPlayOn(0, PHRASE_STARTUP);
     			PowerState=powerStart;
     		}
     		break;
     	case powerStart:
     	    if(!IsPlaying(0)){
-    	    	LoopOn(0, 0);  /* ループ音: フレーズ0（起動音終了後） */
+    	    	SoundDbg_Stop("startup end");
+    	    	RunSound_StartMainLoop();
     			PowerState=powerON;
     	    }
     		if(PowerMV<=POWER_OFF_TH){
+    			SoundDbg_Stop("power off");
     			StopAll();
-    			// StdPlayOn(0, 2);  /* 停止音フレーズ — 仕様上なしのため再生しない */
+    			RunSound_Reset();
     			PowerState=powerStop;
     		}
     		break;
     	case powerON:
+    		RunSound_Task();
     		if(PowerMV<=POWER_OFF_TH){
+    			SoundDbg_Stop("power off");
     			StopAll();
-    			// StdPlayOn(0, 2);  /* 停止音フレーズ — 仕様上なしのため再生しない */
+    			RunSound_Reset();
     			PowerState=powerStop;
     		}
     		break;
 
     	case powerStop:
     	    if(!IsPlaying(0)){
+    			SoundDbg_Stop("idle");
     			PowerState=powerIdle;
     	    }
     		if(PowerMV>=POWER_ON_TH){
+    			SoundDbg_Stop("re-power");
     			StopAll();
-    			StdPlayOn(0, 1);  /* 再投入時の起動音: フレーズ1（powerIdle 遷移時と同じ） */
+    			RunSound_Reset();
+    			SoundDbg_Play(PHRASE_STARTUP);
+    			StdPlayOn(0, PHRASE_STARTUP);
     			PowerState=powerStart;
     		}
     		break;
