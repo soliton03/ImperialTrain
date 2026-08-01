@@ -69,6 +69,15 @@ DMA_HandleTypeDef hdma_usart1_tx;
 #define POWER_ON_TH		((5000 * 5300) / 6500)	/* 実5.0V超 ≒ 読取4076mV */
 #define POWER_OFF_TH	((4000 * 4700) / 6000)	/* 実4.0V未満 ≒ 読取3133mV */
 
+/* 尾灯方向更新: 手動逆転は 10〜40ms 程度の短い電源低下もある。
+ * PowerMV < DIR_POWER_OFF_MV が DIR_POWER_OFF_MS 以上 → armed。
+ * 方向の確定は電源復帰後 DIR_RECOVER_MS 待ってから VM を読む（OFF 中は確定しない）。
+ * ADC 周期が 10ms のため、OFF 閾値は最短 1 サンプル。 */
+#define DIR_POWER_OFF_MV    4000
+#define DIR_POWER_OFF_MS      10U
+#define DIR_RECOVER_MS        30U
+#define POWER_ADC_PERIOD_MS   10U
+
 /* 音源フェーズ (CH0) */
 #define PHRASE_FAN_LOOP    0   /* お召列車ラジエータファンループ */
 #define PHRASE_RUN_LOOP    1   /* 走行音 */
@@ -120,10 +129,16 @@ static const char * const PowerStateName[]={
 #define OFF	0
 
 //極性判定回路用==========================
-/* VMがPW_LONG(72ms)超えて同一→極性確定。Quantum半ビット(最大72ms)は無視 */
+/* VMがPW_LONG(72ms)超えて同一→極性候補。尾灯反映は電源OFF(DIR_POWER_*)を挟んだときだけ */
 volatile int IsNormalDir=true;	//true=進行方向, false=逆方向(尾灯点灯)
 static volatile uint8_t DirLastVM=0;
 static volatile uint16_t DirHoldMs=0;
+static volatile uint16_t DirPowerOffMs=0;
+static volatile uint8_t DirRelatchArmed=0;
+static volatile uint8_t DirPowerOk=1; /* 0=電源OFF相当 */
+static uint16_t DirRecoverMs=0;
+static uint8_t DirPowerWasOff=0;
+static int LastLoggedDir=-1;
 
 typedef enum {
   QS_IDLE  = 0,
@@ -879,13 +894,14 @@ static void QA_1msTick(void)
   } else {
     CmdFrameIdleMs = 0;
   }
-  // 方向判定: VMがPW_LONG超えて同一なら極性確定（Quantum半ビットは最大72msのため無視）
-  if (cVM == (int)DirLastVM) {
+  /* 尾灯方向の確定はメインループ（電源復帰＋短デバウンス）で行う。
+   * ここでは Quantum 用の VM 安定計測のみ（DirHoldMs は互換のため維持）。 */
+  if (DirPowerOk == 0U) {
+    DirLastVM = (uint8_t)cVM;
+    DirHoldMs = 0;
+  } else if (cVM == (int)DirLastVM) {
     if (DirHoldMs < 0xFFFFu) {
       DirHoldMs++;
-    }
-    if (DirHoldMs > PW_LONG) {
-      IsNormalDir = (cVM != 0);
     }
   } else {
     DirLastVM = (uint8_t)cVM;
@@ -1093,7 +1109,13 @@ static void QA_Init(void)
   VM = lVM;
   DirLastVM = lVM;
   DirHoldMs = 0;
+  DirPowerOffMs = 0;
+  DirRelatchArmed = 0U;
+  DirPowerOk = 1U;
+  DirRecoverMs = 0;
+  DirPowerWasOff = 0U;
   IsNormalDir = true;
+  LastLoggedDir = IsNormalDir; /* 起動直後の偽 DIR_NOW を出さない */
   SetTailLED(IsNormalDir);
   /* QS_IDLE のままだと 1ms ティック最初の「擬似エッジ」(QS_IDLE→SET/RESET) で CmdMode が true になり、
    * 状態が安定しているだけで約 PW_WHISTLE ms 後に汽笛(ホイッスル)が誤発火する。
@@ -1456,16 +1478,80 @@ int main(void)
 	  //TailLampの処理==============================================
 	  SetTailLED(IsNormalDir);
 
-	  //ADCの取得===================================================
-	    if (Elapsed(adc_tick) >= 1000)
+	  //ADCの取得（尾灯方向用 OFF 判定のため 10ms 周期）===============
+	    if (Elapsed(adc_tick) >= POWER_ADC_PERIOD_MS)
 	    {
-	        adc_tick += 1000;     // ← nowにしないのがポイント
+	        adc_tick += POWER_ADC_PERIOD_MS;
 
 	        int val = AdcRead();
 	        if(val>=0){
+	        	uint16_t off_ms;
+	        	uint8_t became_armed;
+	        	int vm_now;
 	        	PowerMV=GetPower_mV(val);
+	        	if (PowerMV < DIR_POWER_OFF_MV) {
+	        		DirPowerOk = 0U;
+	        		DirRecoverMs = 0;
+	        		if (DirPowerOffMs < 0xFFFFu) {
+	        			DirPowerOffMs = (uint16_t)(DirPowerOffMs + POWER_ADC_PERIOD_MS);
+	        		}
+	        		became_armed = 0U;
+	        		if (DirPowerOffMs >= DIR_POWER_OFF_MS) {
+	        			if (DirRelatchArmed == 0U) {
+	        				became_armed = 1U;
+	        			}
+	        			DirRelatchArmed = 1U;
+	        		}
+	        		DirPowerWasOff = 1U;
+	        		if (became_armed != 0U) {
+	        			printf("DIR_ARM off=%ums Power=%dmV\n",
+	        			       (unsigned)DirPowerOffMs, PowerMV);
+	        		}
+	        	} else {
+	        		DirPowerOk = 1U;
+	        		if (DirPowerWasOff != 0U) {
+	        			off_ms = DirPowerOffMs;
+	        			printf("DIR_OFF %ums (th=%dms/%dmV) Power=%dmV armed=%u dir=%d\n",
+	        			       (unsigned)off_ms,
+	        			       (int)DIR_POWER_OFF_MS,
+	        			       (int)DIR_POWER_OFF_MV,
+	        			       PowerMV,
+	        			       (unsigned)DirRelatchArmed,
+	        			       IsNormalDir);
+	        			DirPowerWasOff = 0U;
+	        			DirRecoverMs = 0; /* 復帰デバウンス開始 */
+	        		}
+	        		DirPowerOffMs = 0;
+
+	        		/* armed 中は復帰後 DIR_RECOVER_MS 安定してから VM で確定 */
+	        		if (DirRelatchArmed != 0U) {
+	        			if (DirRecoverMs < 0xFFFFu) {
+	        				DirRecoverMs = (uint16_t)(DirRecoverMs + POWER_ADC_PERIOD_MS);
+	        			}
+	        			if (DirRecoverMs >= DIR_RECOVER_MS) {
+	        				vm_now = digitalRead_VM();
+	        				IsNormalDir = (vm_now != 0);
+	        				DirRelatchArmed = 0U;
+	        				DirRecoverMs = 0;
+	        				DirLastVM = (uint8_t)vm_now;
+	        				DirHoldMs = 0;
+	        				printf("DIR_LATCH %s vm=%d Power=%dmV\n",
+	        				       IsNormalDir ? "FWD" : "REV",
+	        				       vm_now, PowerMV);
+	        			}
+	        		} else {
+	        			DirRecoverMs = 0;
+	        		}
+	        	}
+	        	if (LastLoggedDir != IsNormalDir) {
+	        		LastLoggedDir = IsNormalDir;
+	        		printf("DIR_NOW %s Power=%dmV\n",
+	        		       IsNormalDir ? "FWD" : "REV",
+	        		       PowerMV);
+	        	}
 #ifdef POWER_CHECK_MODE
-	        	printf("Power=%dmV\n",PowerMV);
+	        	printf("Power=%dmV armed=%u ok=%u\n",
+	        	       PowerMV, (unsigned)DirRelatchArmed, (unsigned)DirPowerOk);
 #endif
 	        }
 	    }
