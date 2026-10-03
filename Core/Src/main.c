@@ -41,7 +41,10 @@
 
 /* Private macro -------------------------------------------------------------*/
 /* USER CODE BEGIN PM */
-#define SOUND_DEBUG     /* サウンド再生/停止/切替のUART診断 */
+/* 製品版: 以下の診断マクロはすべて無効 */
+//#define SOUND_DEBUG     /* サウンド再生/停止/切替のUART診断 */
+//#define SOUND_TEST_MENU /* 音源確認メニュー(USART1): 1起動 2走行 3ラジエータ 0停止 */
+//#define DIR_DEBUG       /* 尾灯方向/Power心拍のUART診断 */
 //#define QA_RX_TRACE   /* [pop/skip/pair/drop/deb 018 m=0 v=2] 形式の診断ログ */
 //#define CMD_DEBUG
 /* USER CODE END PM */
@@ -62,42 +65,61 @@ DMA_HandleTypeDef hdma_usart1_tx;
 //=====================================
 // 電圧スレッシュホールド
 //=====================================
-//#define POWER_CHECK_MODE	//シリアルポートで電圧をチェック
+#define POWER_VOLT_LOG	/* 1秒ごとに入力電圧をUART表示（始動診断用） */
 
 /* しきい値は ADC 読取電圧(mV)。実電圧はブリッジ等の降下分を含む。
  * 校正: 実6.5V→5300, 実6.0V→4700 (GetPower_mV 換算値) */
 #define POWER_ON_TH		((5000 * 5300) / 6500)	/* 実5.0V超 ≒ 読取4076mV */
 #define POWER_OFF_TH	((4000 * 4700) / 6000)	/* 実4.0V未満 ≒ 読取3133mV */
 
-/* 尾灯方向更新: 手動逆転は 10〜40ms 程度の短い電源低下もある。
- * PowerMV < DIR_POWER_OFF_MV が DIR_POWER_OFF_MS 以上 → armed。
- * 方向の確定は電源復帰後 DIR_RECOVER_MS 待ってから VM を読む（OFF 中は確定しない）。
- * ADC 周期が 10ms のため、OFF 閾値は最短 1 サンプル。 */
-#define DIR_POWER_OFF_MV    4000
-#define DIR_POWER_OFF_MS      10U
-#define DIR_RECOVER_MS        30U
-#define POWER_ADC_PERIOD_MS   10U
+/* 尾灯方向: 電源OFFを挟んだときだけ更新（ベル極性フリップは無視）。
+ * 低電圧運転（実測 Power 読取 ~2.5V）でも武装・復帰できるよう
+ * ON/OFF しきい値は 2.5V 未満に置く。逆転は主に peak からの落下でも検知。 */
+#define DIR_POWER_OFF_MV      1200 /* deep OFF / reverse gap */
+#define DIR_POWER_ON_MV       1800 /* solid ON (must be < typical run ~2500) */
+#define DIR_POWER_OFF_MS         2U /* >=2ms below OFF_MV to arm */
+#define DIR_DROP_ARM_MV        600 /* low-V minimum peak-to-now drop to arm */
+#define DIR_DROP_ARM_PCT        40U /* low-V only: also require ~40% drop from peak */
+#define DIR_DROP_ARM_MAX_PEAK  4000 /* peakがこれ超ならDROP武装しない（スロットル下げ誤検出防止） */
+#define DIR_VM_CHANGE_MS        40U /* VM stable window (PowerON / armed latch) */
+/* 電源が落ちない手動反転: Quantum短パルスより長くVMが安定したらDIRを追従。
+ * 汽笛/コマンド中は CmdMode/IsWhistle で抑制。 */
+#define DIR_VM_FOLLOW_MS       200U
+/* After power-good while armed:
+ *  prev=FWD → wait VM=1 (REV). Do NOT force while VM still 0.
+ *  prev=REV → take VM=0 early as FWD (late VM=1 is a lie on return). */
+#define DIR_FWD_FORCE_MS       200U /* was REV: force FWD if no VM=1 */
+#define DIR_REV_FORCE_MS       600U /* was FWD: wait longer for VM=0 */
+#define DIR_REV_FORCE_HARD_MS  900U /* last resort even if VM still 1 */
+#define DIR_ON_SETTLE_MS        50U
+#define POWER_ADC_PERIOD_MS      1U /* 1ms: do not miss short power gap */
 
 /* 音源フェーズ (CH0) */
 #define PHRASE_FAN_LOOP    0   /* お召列車ラジエータファンループ */
 #define PHRASE_RUN_LOOP    1   /* 走行音 */
 #define PHRASE_STARTUP     2   /* 起動音 */
 
-#define RUN_FAN_TEST_SHORT   /* テスト: 1分毎（本番はコメントアウトして5分） */
+#define RUN_FAN_TEST_SHORT   /* テスト: 30秒毎（本番はコメントアウトして5分） */
 #ifdef RUN_FAN_TEST_SHORT
-#define RUN_FAN_INTERVAL_MS  (1u * 60u * 1000u) /* テスト: 1分毎 */
+#define RUN_FAN_INTERVAL_MS  (30u * 1000u)      /* テスト: 30秒毎 */
 #else
-#define RUN_FAN_INTERVAL_MS  (5u * 60u * 1000u) /* 走行音5分毎 */
+#define RUN_FAN_INTERVAL_MS  (5u * 60u * 1000u) /* 5分毎にラジエター重ね */
 #endif
-#define RUN_FAN_DURATION_MS  (30u * 1000u)     /* ラジエター音30秒 */
+#define RUN_FAN_DURATION_MS  (30u * 1000u)     /* ラジエター重ね 30秒 */
+#define RUN_FAN_FADE_MS      (2u * 1000u)      /* フェードイン/アウト各2秒 */
+#define CH_RUN               0
+#define CH_FAN               1
 
 typedef enum {
-  runMainLoop,
-  runFanLoop
+  runMainLoop,  /* 走行音のみ（インターバル待ち） */
+  runFanLoop    /* 走行音 + ラジエター重ね */
 } RunSoundMode;
 
 static RunSoundMode RunSoundState = runMainLoop;
 static uint32_t RunModeSince = 0;
+/* ラジエターCH相対音量 0=無音 … 255=マスターと同じ（_SetCVolAll が参照） */
+static uint8_t FanVolScale = 0;
+static int FanCountdownLastSec = -1;
 
 enum enPowerState{
 	powerIdle,powerStart,powerON,powerStop
@@ -138,6 +160,34 @@ static volatile uint8_t DirRelatchArmed=0;
 static volatile uint8_t DirPowerOk=1; /* 0=電源OFF相当 */
 static uint16_t DirRecoverMs=0;
 static uint8_t DirPowerWasOff=0;
+static uint8_t DirVmCand=0xFFu;   /* 復帰後の VM 候補 */
+static uint16_t DirVmStableMs=0;  /* VM 候補が続いている時間 */
+static uint16_t DirPowerPeakMv=0; /* recent peak for drop-arm */
+static uint8_t DirArmLogged=0;
+static uint8_t DirAllowArm=0; /* need solid ON before arming */
+static uint8_t DirHadSolidOn=0; /* 1 after Power has been good at least once */
+static uint8_t DirPostChangeLock=0; /* 1: block arm after CHANGE until ON settled */
+static uint16_t DirOnSettleMs=0;
+static uint8_t DirVmPowerGood=0; /* hyst: set @ON_MV, clear @OFF_MV */
+static uint8_t DirInitPending=1; /* 1: next solid ON latches absolute DIR from VM */
+static uint8_t DirInitCand=0xFFu;
+static uint16_t DirInitStableMs=0;
+static uint8_t DirFollowCand=0xFFu;
+static uint16_t DirFollowStableMs=0;
+static uint8_t DirMeasEnable=0; /* 1: log power/VM edges with timestamps */
+static uint32_t DirMeasT0=0;
+static int8_t DirMeasLastPwr=-1; /* -1 unk, 0 off-like, 1 on */
+static int8_t DirMeasLastVm=-1;
+static uint8_t DirVmWatchEnable=0; /* 1: print VMIN edges when Power is OK */
+static int8_t DirVmWatchLast=-1;
+static uint8_t DirVmWatchBrownout=0; /* 1: already noted brownout this dip */
+#ifdef DIR_DEBUG
+static uint32_t DirPowerLogMs=0; /* last periodic Power log */
+static uint8_t DirWaitLogged=0;
+#endif
+#ifdef POWER_VOLT_LOG
+static uint32_t PowerVoltLogMs=0;
+#endif
 static int LastLoggedDir=-1;
 
 typedef enum {
@@ -201,13 +251,38 @@ static inline int digitalRead_VP(void){
 static inline int digitalRead_VM(void){
   return HAL_GPIO_ReadPin(VMIN_GPIO_Port, VMIN_Pin) ? 1 : 0;
 }
+/* VM=1 → 反転(REV/尾灯ON), VM=0 → 正転(FWD/尾灯OFF) */
+static inline int DirFromVm(int vm)
+{
+  return vm ? 0 : 1;
+}
 static inline void digitalWrite_IO0(int level){
   HAL_GPIO_WritePin(IO0_GPIO_Port, IO0_Pin, level ? GPIO_PIN_SET : GPIO_PIN_RESET);
 }
 /* isNormalDir: true=進行方向(消灯), false=逆方向(点灯). nTailLEDはActive-L */
 static inline void SetTailLED(int isNormalDir){
+  /* Active-L: FWD(消灯)=High, REV(点灯)=Low */
   HAL_GPIO_WritePin(nTailLED_GPIO_Port, nTailLED_Pin,
                     isNormalDir ? GPIO_PIN_SET : GPIO_PIN_RESET);
+}
+
+static inline int TailLedGpioIsHigh(void){
+  return (HAL_GPIO_ReadPin(nTailLED_GPIO_Port, nTailLED_Pin) == GPIO_PIN_SET) ? 1 : 0;
+}
+
+/* Apply direction to LED and log what the pin actually is. */
+static void DirApplyTailLed(const char *why)
+{
+  SetTailLED(IsNormalDir);
+#ifdef DIR_DEBUG
+  printf("TAIL %s (%s) nTailLED=%s gpio=%d\n",
+         IsNormalDir ? "OFF" : "ON",
+         why,
+         IsNormalDir ? "H(off)" : "L(on)",
+         TailLedGpioIsHigh());
+#else
+  (void)why;
+#endif
 }
 
 static inline void digitalWrite_IO2(int level){
@@ -425,10 +500,10 @@ void delay_ms(unsigned int ms){
 
 
 int AdcRead(){
-	//Errorなら、-1
+	// Errorなら -1
 	int val=-1;
     HAL_ADC_Start(&hadc1);
-    if(HAL_ADC_PollForConversion(&hadc1, 1000)==HAL_OK){
+    if(HAL_ADC_PollForConversion(&hadc1, 2)==HAL_OK){
     	val = (int)HAL_ADC_GetValue(&hadc1);
     }
     HAL_ADC_Stop(&hadc1);
@@ -725,7 +800,27 @@ void SetCVolAll(uint8_t vol0_255)
 
 void _SetCVolAll(uint8_t cv)
 {
-    for (uint8_t ch=0; ch<4; ch++) (void)SOUND_SendCVOL(ch, cv, 50);
+    /* CVOL: 0=最大, 127=ミュート。振幅相当 amp=(127-cv)
+     *
+     * 重ね時に走行音量を変えない方針:
+     *  - 常に各CHの上限を master の約1/2(-6dB)に固定（MIX_CH_SCALE）
+     *  - 走行は常にその上限（重ね中も一定）
+     *  - ラジエターは 0→上限→0 でフェード
+     *  - 両者最大時の合計 ≈ master フル → 合成クランプしない
+     * 結果として単音時も約-6dB下がるが、重ねで音量が変わらない。 */
+#define MIX_CH_SCALE  128u  /* /255 ≈ 0.5 (-6dB)。まだクリップするなら 100〜110 に下げる */
+    uint16_t master_amp = (uint16_t)(127u - cv);
+    uint16_t ch_ceil = (master_amp * MIX_CH_SCALE) / 255u;
+    uint16_t run_amp = ch_ceil;
+    uint16_t fan_amp = (ch_ceil * (uint16_t)FanVolScale) / 255u;
+    uint8_t run_cv = (uint8_t)(127u - run_amp);
+    uint8_t fan_cv = (uint8_t)(127u - fan_amp);
+
+    (void)SOUND_SendCVOL(CH_RUN, run_cv, 50);
+    (void)SOUND_SendCVOL(CH_FAN, fan_cv, 50);
+    (void)SOUND_SendCVOL(2, 127, 50);
+    (void)SOUND_SendCVOL(3, 127, 50);
+#undef MIX_CH_SCALE
 }
 
 
@@ -1047,7 +1142,9 @@ static void QA_HandleCmd(int cmd)
   case QA_CMD_VOL_UP:
     VolumeUp();
     VolUpGuardUntil = now + VOLUP_GUARD_MS;
+#ifdef CMD_DEBUG
     printf("Volume Up\n");
+#endif
     QA_SuppressRx(CMD_RX_SUPPRESS_MS);
     break;
   case QA_CMD_VOL_DOWN:
@@ -1057,17 +1154,23 @@ static void QA_HandleCmd(int cmd)
       break;
     }
     VolumeDown();
+#ifdef CMD_DEBUG
     printf("Volume Down\n");
+#endif
     QA_SuppressRx(CMD_RX_SUPPRESS_MS);
     break;
   case QA_CMD_MUTE:
     wasMuted = IsMuted;
     if (wasMuted) {
       SetMute(0);
+#ifdef CMD_DEBUG
       printf("Mute OFF\n");
+#endif
     } else {
       SetMute(1);
+#ifdef CMD_DEBUG
       printf("Mute ON\n");
+#endif
     }
     QA_SuppressRx(CMD_RX_SUPPRESS_MS);
     break;
@@ -1114,7 +1217,21 @@ static void QA_Init(void)
   DirPowerOk = 1U;
   DirRecoverMs = 0;
   DirPowerWasOff = 0U;
-  IsNormalDir = true;
+  DirPowerPeakMv = 0;
+  DirArmLogged = 0U;
+  DirAllowArm = 0U;
+  DirHadSolidOn = 0U;
+  DirPostChangeLock = 0U;
+  DirOnSettleMs = 0;
+  DirVmPowerGood = 0U;
+  DirVmCand = 0xFFu;
+  DirVmStableMs = 0;
+  DirInitPending = 1U;
+  DirInitCand = 0xFFu;
+  DirInitStableMs = 0;
+  DirFollowCand = 0xFFu;
+  DirFollowStableMs = 0;
+  IsNormalDir = true; /* PowerONでVMから確定するまで仮の正転 */
   LastLoggedDir = IsNormalDir; /* 起動直後の偽 DIR_NOW を出さない */
   SetTailLED(IsNormalDir);
   /* QS_IDLE のままだと 1ms ティック最初の「擬似エッジ」(QS_IDLE→SET/RESET) で CmdMode が true になり、
@@ -1345,42 +1462,538 @@ static void SoundDbg_Stop(const char *reason)
 }
 #endif
 
+/* ラジエター重ね: 先頭2秒フェードイン、末尾2秒フェードアウト → 0..255 */
+static uint8_t RunSound_FanFadeScale(uint32_t elapsed_ms)
+{
+  uint32_t remain;
+
+  if (elapsed_ms >= RUN_FAN_DURATION_MS) {
+    return 0U;
+  }
+  if (elapsed_ms < RUN_FAN_FADE_MS) {
+    return (uint8_t)((elapsed_ms * 255u) / RUN_FAN_FADE_MS);
+  }
+  if (elapsed_ms >= (RUN_FAN_DURATION_MS - RUN_FAN_FADE_MS)) {
+    remain = RUN_FAN_DURATION_MS - elapsed_ms;
+    return (uint8_t)((remain * 255u) / RUN_FAN_FADE_MS);
+  }
+  return 255U;
+}
+
+static void RunSound_ApplyFanVol(uint8_t scale)
+{
+  if (FanVolScale == scale) {
+    return;
+  }
+  FanVolScale = scale;
+  _SetVolume();
+}
+
+#ifdef SOUND_DEBUG
+static void RunSound_Countdown(uint32_t remain_ms, const char *phase)
+{
+  int sec;
+
+  if (remain_ms == 0U) {
+    sec = 0;
+  } else {
+    sec = (int)((remain_ms + 999u) / 1000u); /* 切り上げ秒 */
+  }
+  if (sec == FanCountdownLastSec) {
+    return;
+  }
+  FanCountdownLastSec = sec;
+  printf("FAN %s %ds (vol=%u/255)\n", phase, sec, (unsigned)FanVolScale);
+}
+#else
+static void RunSound_Countdown(uint32_t remain_ms, const char *phase)
+{
+  (void)remain_ms;
+  (void)phase;
+}
+#endif
+
 static void RunSound_Reset(void)
 {
   RunSoundState = runMainLoop;
   RunModeSince = 0;
+  FanVolScale = 0U;
+  FanCountdownLastSec = -1;
 }
 
 static void RunSound_StartMainLoop(void)
 {
+  FanVolScale = 0U;
+  _SetVolume();
+  (void)StopOn(CH_FAN);
   SoundDbg_Loop(PHRASE_RUN_LOOP);
-  (void)LoopOn(0, PHRASE_RUN_LOOP);
+  (void)LoopOn(CH_RUN, PHRASE_RUN_LOOP);
   RunSoundState = runMainLoop;
   RunModeSince = HAL_GetTick();
+  FanCountdownLastSec = -1;
 }
 
-/* powerON中: 5分毎に30秒ラジエター音(0)を挿入し走行音(1)へ復帰 */
+/* 軌道電源ON時: 音源を再初期化してから始動音（USB通電中の後付け電源でも可） */
+static void SoundPowerOn_Start(void)
+{
+  (void)SoundInit();
+  FanVolScale = 0U;
+  _SetVolume();
+  SoundDbg_Play(PHRASE_STARTUP);
+  (void)StopAll();
+  (void)StdPlayOn(CH_RUN, PHRASE_STARTUP);
+}
+
+/* 方向切替時: 走行中なら始動音からやり直す（SoundInitはしない） */
+static void SoundRestartFromStartup(void)
+{
+  FanVolScale = 0U;
+  _SetVolume();
+  (void)StopAll();
+  RunSound_Reset();
+  SoundDbg_Play(PHRASE_STARTUP);
+  (void)StdPlayOn(CH_RUN, PHRASE_STARTUP);
+  PowerState = powerStart;
+}
+
+#ifdef SOUND_TEST_MENU
+static uint8_t SoundTestActive = 1U; /* 1=音源確認メニュー, 0=通常(電源連動) */
+
+/* USART1(VCP) から非ブロッキング1文字取得 */
+static int Uart1_TryGetChar(char *out)
+{
+  if (__HAL_UART_GET_FLAG(&huart1, UART_FLAG_ORE) != 0U) {
+    __HAL_UART_CLEAR_FLAG(&huart1, UART_CLEAR_OREF);
+  }
+  if (__HAL_UART_GET_FLAG(&huart1, UART_FLAG_RXNE) == 0U) {
+    return 0;
+  }
+  *out = (char)(huart1.Instance->RDR & 0xFFu);
+  return 1;
+}
+
+static void SoundTest_PrintDir(void)
+{
+  int vm = digitalRead_VM();
+  printf("DIR status: %s Tail=%s vm=%d Power=%dmV armed=%u ok=%u nTailLED_gpio=%d\n",
+         IsNormalDir ? "FWD" : "REV",
+         IsNormalDir ? "OFF" : "ON",
+         vm, PowerMV,
+         (unsigned)DirRelatchArmed,
+         (unsigned)DirPowerOk,
+         TailLedGpioIsHigh());
+}
+
+static void SoundTest_PrintMenu(void)
+{
+  printf("\n=== Sound Test Menu (USART1) ===\n");
+  printf("DIR now: %s  Tail=%s  Power=%dmV\n",
+         IsNormalDir ? "FWD" : "REV",
+         IsNormalDir ? "OFF" : "ON",
+         PowerMV);
+  printf("1: Startup     (P%d one-shot CH0)\n", PHRASE_STARTUP);
+  printf("2: Run         (P%d loop CH0)\n", PHRASE_RUN_LOOP);
+  printf("3: Radiator    (P%d loop CH0)\n", PHRASE_FAN_LOOP);
+  printf("4: Run+Radiator overlay (CH0+CH1)\n");
+  printf("0: Stop all\n");
+  printf("d: Show direction status\n");
+  printf("p: Print Power/DIR status now\n");
+  printf("l: Blink nTailLED 3x (find which LED is ours)\n");
+  printf("v: VM pin watch (toggle) — edges when Power OK (skip brownout)\n");
+  printf("m: Measure POWER/VM edges (toggle)\n");
+  printf("n: Normal operation (power-linked)\n");
+  printf("h: Help\n");
+  printf("> ");
+}
+
+static void SoundTest_EnterNormal(void)
+{
+  printf("-> Normal mode (power-linked). Press 't' for test menu.\n");
+  StopAll();
+  FanVolScale = 0U;
+  _SetVolume();
+  RunSound_Reset();
+  SoundTestActive = 0U;
+  if (PowerMV >= POWER_ON_TH) {
+    SoundDbg_Play(PHRASE_STARTUP);
+    (void)StdPlayOn(CH_RUN, PHRASE_STARTUP);
+    PowerState = powerStart;
+  } else {
+    PowerState = powerIdle;
+    printf("Waiting for power ON...\n");
+  }
+}
+
+static void SoundTest_EnterTest(void)
+{
+  printf("-> Sound test menu\n");
+  StopAll();
+  FanVolScale = 0U;
+  _SetVolume();
+  RunSound_Reset();
+  PowerState = powerIdle;
+  SoundTestActive = 1U;
+  SoundTest_PrintMenu();
+}
+
+static void SoundTest_Task(void)
+{
+  char c;
+
+  if (Uart1_TryGetChar(&c) == 0) {
+    return;
+  }
+  if (c == '\r' || c == '\n') {
+    return;
+  }
+  printf("%c\n", c);
+
+  switch (c) {
+  case '0':
+    SoundDbg_Stop("test menu");
+    StopAll();
+    FanVolScale = 0U;
+    _SetVolume();
+    break;
+  case '1':
+    StopAll();
+    FanVolScale = 0U;
+    _SetVolume();
+    SoundDbg_Play(PHRASE_STARTUP);
+    (void)StdPlayOn(CH_RUN, PHRASE_STARTUP);
+    break;
+  case '2':
+    StopAll();
+    FanVolScale = 0U;
+    _SetVolume();
+    SoundDbg_Loop(PHRASE_RUN_LOOP);
+    (void)LoopOn(CH_RUN, PHRASE_RUN_LOOP);
+    break;
+  case '3':
+    StopAll();
+    FanVolScale = 0U;
+    _SetVolume();
+    SoundDbg_Loop(PHRASE_FAN_LOOP);
+    (void)LoopOn(CH_RUN, PHRASE_FAN_LOOP);
+    break;
+  case '4':
+    StopAll();
+    FanVolScale = 255U;
+    _SetVolume();
+    SoundDbg_Loop(PHRASE_RUN_LOOP);
+    (void)LoopOn(CH_RUN, PHRASE_RUN_LOOP);
+    SoundDbg_Loop(PHRASE_FAN_LOOP);
+    (void)LoopOn(CH_FAN, PHRASE_FAN_LOOP);
+    break;
+  case 'n':
+  case 'N':
+    SoundTest_EnterNormal();
+    return;
+  case 'd':
+  case 'D':
+    SoundTest_PrintDir();
+    break;
+  case 'p':
+  case 'P':
+    printf("Power=%dmV good=%u allow=%u hadOn=%u armed=%u lock=%u VM=%d Tail=%s\n",
+           PowerMV,
+           (unsigned)DirVmPowerGood,
+           (unsigned)DirAllowArm,
+           (unsigned)DirHadSolidOn,
+           (unsigned)DirRelatchArmed,
+           (unsigned)DirPostChangeLock,
+           digitalRead_VM() ? 1 : 0,
+           IsNormalDir ? "OFF" : "ON");
+    if (PowerMV < DIR_POWER_ON_MV) {
+      printf("  (DIR ready needs Power>=%dmV)\n", DIR_POWER_ON_MV);
+    }
+    break;
+  case 'l':
+  case 'L':
+    {
+      int i;
+      printf("Blink nTailLED (PB7) 3 times — watch which lamp toggles\n");
+      for (i = 0; i < 3; i++) {
+        HAL_GPIO_WritePin(nTailLED_GPIO_Port, nTailLED_Pin, GPIO_PIN_RESET);
+        printf("  [%d] LED drive ON (gpio L) gpio=%d\n", i + 1, TailLedGpioIsHigh());
+        HAL_Delay(300);
+        HAL_GPIO_WritePin(nTailLED_GPIO_Port, nTailLED_Pin, GPIO_PIN_SET);
+        printf("  [%d] LED drive OFF (gpio H) gpio=%d\n", i + 1, TailLedGpioIsHigh());
+        HAL_Delay(300);
+      }
+      SetTailLED(IsNormalDir);
+      printf("restored TAIL %s gpio=%d\n",
+             IsNormalDir ? "OFF" : "ON", TailLedGpioIsHigh());
+    }
+    break;
+  case 'm':
+  case 'M':
+    DirMeasEnable = (DirMeasEnable != 0U) ? 0U : 1U;
+    DirMeasLastPwr = -1;
+    DirMeasLastVm = -1;
+    DirMeasT0 = HAL_GetTick();
+    printf("MEAS %s (reverse power and/or whistle; watch T+..ms lines)\n",
+           DirMeasEnable ? "ON" : "OFF");
+    break;
+  case 'v':
+  case 'V':
+    DirVmWatchEnable = (DirVmWatchEnable != 0U) ? 0U : 1U;
+    DirVmWatchLast = -1;
+    DirVmWatchBrownout = 0U;
+    printf("VM watch %s (VMIN edges only when Power>=%dmV)\n",
+           DirVmWatchEnable ? "ON" : "OFF", DIR_POWER_ON_MV);
+    break;
+  case 'h':
+  case 'H':
+  case '?':
+    SoundTest_PrintMenu();
+    return;
+  default:
+    printf("unknown key\n");
+    SoundTest_PrintMenu();
+    return;
+  }
+  printf("> ");
+}
+#endif /* SOUND_TEST_MENU */
+
+/* powerON中: 走行音は常時ループ。間隔毎にラジエターをCH1で30秒重ね（両端2秒フェード） */
+
+/* 電源復帰後の方向確定。変化は早く、同一は長く待ってから武装解除。 */
+/* After recover: CHANGED fast; SAME waits long so late VM flip is caught.
+ * Also print keep/arm so missed return reverse is diagnosable. */
+
+static void DirMeas_Update(uint8_t off_like)
+{
+  int vm;
+  int8_t pwr;
+  uint32_t dt;
+
+  if (DirMeasEnable == 0U) {
+    return;
+  }
+  pwr = (off_like != 0U) ? (int8_t)0 : (int8_t)1;
+  vm = digitalRead_VM() ? 1 : 0;
+  dt = HAL_GetTick() - DirMeasT0;
+  if (DirMeasLastPwr < 0) {
+    DirMeasLastPwr = pwr;
+    DirMeasLastVm = (int8_t)vm;
+    printf("MEAS start Power=%dmV VM=%d\n", PowerMV, vm);
+    return;
+  }
+  if (pwr != DirMeasLastPwr) {
+    printf("T+%lums POWER %s->%s %dmV\n",
+           (unsigned long)dt,
+           DirMeasLastPwr ? "ON" : "OFF",
+           pwr ? "ON" : "OFF",
+           PowerMV);
+    DirMeasLastPwr = pwr;
+  }
+  if (vm != (int)DirMeasLastVm) {
+    printf("T+%lums VM %d->%d Power=%dmV\n",
+           (unsigned long)dt,
+           (int)DirMeasLastVm, vm, PowerMV);
+    DirMeasLastVm = (int8_t)vm;
+  }
+}
+
+/* VMIN edge log: skip true brownout (<OFF_MV). Hyst keeps logging across 4500–4800. */
+static void DirVmWatch_Update(void)
+{
+  int vm;
+
+  if (DirVmWatchEnable == 0U) {
+    return;
+  }
+  if (DirVmPowerGood == 0U) {
+    if (DirVmWatchBrownout == 0U) {
+      DirVmWatchBrownout = 1U;
+      printf("VM ignore (brownout Power=%dmV)\n", PowerMV);
+      DirVmWatchLast = -1; /* resync after recover */
+    }
+    return;
+  }
+  DirVmWatchBrownout = 0U;
+  vm = digitalRead_VM() ? 1 : 0;
+  if (DirVmWatchLast < 0) {
+    DirVmWatchLast = (int8_t)vm;
+    printf("VM now=%d Power=%dmV (watch ON, 'v' to toggle)\n", vm, PowerMV);
+    return;
+  }
+  if (vm != (int)DirVmWatchLast) {
+    printf("VM %d->%d Power=%dmV t=%lums\n",
+           (int)DirVmWatchLast, vm, PowerMV,
+           (unsigned long)HAL_GetTick());
+    DirVmWatchLast = (int8_t)vm;
+  }
+}
+
+
+/* Finish a direction update (VM-based or power-gap toggle). */
+static void DirCommitDir(int prev_dir, int new_dir, const char *why)
+{
+  IsNormalDir = new_dir;
+  /* VM polarity: FWD=VM0, REV=VM1 */
+  DirLastVM = (uint8_t)(new_dir ? 0U : 1U);
+  DirHoldMs = 0;
+  LastLoggedDir = IsNormalDir;
+#ifdef DIR_DEBUG
+  printf("DIR %s->%s Tail=%s (%s) Power=%dmV\n",
+         prev_dir ? "FWD" : "REV",
+         IsNormalDir ? "FWD" : "REV",
+         IsNormalDir ? "OFF" : "ON",
+         why,
+         PowerMV);
+#else
+  (void)why;
+#endif
+  DirApplyTailLed(why);
+  DirRelatchArmed = 0U;
+  DirArmLogged = 0U;
+  DirRecoverMs = 0;
+  DirVmStableMs = 0;
+  DirVmCand = 0xFFu;
+  DirPowerOffMs = 0;
+  DirAllowArm = 0U;
+  DirPostChangeLock = 1U;
+  DirOnSettleMs = 0;
+  DirInitPending = 0U;
+  if (PowerMV > 0) {
+    DirPowerPeakMv = (uint16_t)PowerMV;
+  }
+  /* 実際に方向が変わったら始動音から再開（電源ON中のみ） */
+  if (prev_dir != new_dir &&
+      (PowerState == powerON || PowerState == powerStart)) {
+    SoundRestartFromStartup();
+  }
+}
+
+/* Call only while armed and DirVmPowerGood.
+ * Absolute direction from VM (not toggle). Polarity: VM=1→REV, VM=0→FWD.
+ * Asymmetric timing (inverted from old VM=1=FWD mapping):
+ *  FWD→REV: trust VM=1. Do NOT force while VM still 0.
+ *  REV→FWD: trust early VM=0 (late VM=1 is a lie on return). */
+static void DirTryLatchWhileArmed(void)
+{
+  int vm_now;
+  int prev_dir;
+  uint8_t vm_u8;
+
+  if (DirVmPowerGood == 0U) {
+    DirVmCand = 0xFFu;
+    DirVmStableMs = 0;
+    return;
+  }
+
+  if (DirRecoverMs < 0xFFFFu) {
+    DirRecoverMs = (uint16_t)(DirRecoverMs + POWER_ADC_PERIOD_MS);
+  }
+
+  vm_now = digitalRead_VM();
+  vm_u8 = (uint8_t)(vm_now ? 1U : 0U);
+  if (DirVmCand != vm_u8) {
+    DirVmCand = vm_u8;
+    DirVmStableMs = 0;
+  } else if (DirVmStableMs < 0xFFFFu) {
+    DirVmStableMs = (uint16_t)(DirVmStableMs + POWER_ADC_PERIOD_MS);
+  }
+
+  prev_dir = IsNormalDir ? 1 : 0;
+
+  if (prev_dir != 0) {
+    /* Was FWD: need REV (VM=1). Early VM=0 is ramp — never force while VM==0. */
+    if (vm_u8 != 0U && DirVmStableMs >= DIR_VM_CHANGE_MS) {
+      DirCommitDir(prev_dir, 0, "VM-REV");
+      return;
+    }
+    if (DirRecoverMs >= DIR_REV_FORCE_MS && vm_u8 != 0U) {
+      DirCommitDir(prev_dir, 0, "force-REV");
+      return;
+    }
+    if (DirRecoverMs >= DIR_REV_FORCE_HARD_MS) {
+      if (vm_u8 != 0U) {
+        DirCommitDir(prev_dir, 0, "force-REV-hard");
+      } else if (DirVmStableMs >= DIR_VM_CHANGE_MS) {
+        /* VM=0=正転のまま — スロットル下げ等の誤武装。方向は変えない */
+        DirRelatchArmed = 0U;
+        DirArmLogged = 0U;
+        DirRecoverMs = 0;
+        DirVmStableMs = 0;
+        DirVmCand = 0xFFu;
+        DirAllowArm = 1U;
+        DirPowerPeakMv = (uint16_t)PowerMV;
+      }
+    }
+  } else {
+    /* Was REV: take VM=0 as FWD. Do NOT force FWD while VM stays 1. */
+    if (vm_u8 == 0U && DirVmStableMs >= DIR_VM_CHANGE_MS) {
+      DirCommitDir(prev_dir, 1, "VM-FWD");
+      return;
+    }
+    if (DirRecoverMs >= DIR_FWD_FORCE_MS && vm_u8 == 0U) {
+      DirCommitDir(prev_dir, 1, "force-FWD");
+      return;
+    }
+    if (DirRecoverMs >= DIR_FWD_FORCE_MS &&
+        vm_u8 != 0U && DirVmStableMs >= DIR_VM_CHANGE_MS) {
+      /* Confirmed still REV after gap — drop arm, keep taillight ON */
+      DirRelatchArmed = 0U;
+      DirArmLogged = 0U;
+      DirRecoverMs = 0;
+      DirVmStableMs = 0;
+      DirVmCand = 0xFFu;
+      DirAllowArm = 1U;
+      DirPowerPeakMv = (uint16_t)PowerMV;
+    }
+  }
+}
+
+
+
+
+
 static void RunSound_Task(void)
 {
   uint32_t now = HAL_GetTick();
   uint32_t elapsed = now - RunModeSince;
+  uint32_t remain;
+  uint8_t scale;
 
   if (RunSoundState == runMainLoop) {
     if (elapsed >= RUN_FAN_INTERVAL_MS) {
-      SoundDbg_Stop("switch to fan");
       SoundDbg_Loop(PHRASE_FAN_LOOP);
-      (void)StopOn(0);
-      (void)LoopOn(0, PHRASE_FAN_LOOP);
+      FanCountdownLastSec = -1;
+      RunSound_ApplyFanVol(0U);
+      (void)LoopOn(CH_FAN, PHRASE_FAN_LOOP);
       RunSoundState = runFanLoop;
       RunModeSince = now;
+      elapsed = 0;
+    } else {
+      remain = RUN_FAN_INTERVAL_MS - elapsed;
+      RunSound_Countdown(remain, "next");
+      return;
     }
-  } else if (elapsed >= RUN_FAN_DURATION_MS) {
-    SoundDbg_Stop("fan end");
-    SoundDbg_Loop(PHRASE_RUN_LOOP);
-    (void)StopOn(0);
-    (void)LoopOn(0, PHRASE_RUN_LOOP);
+  }
+
+  /* runFanLoop */
+  scale = RunSound_FanFadeScale(elapsed);
+  RunSound_ApplyFanVol(scale);
+  if (elapsed >= RUN_FAN_DURATION_MS) {
+    SoundDbg_Stop("fan overlay end");
+    (void)StopOn(CH_FAN);
+    RunSound_ApplyFanVol(0U);
     RunSoundState = runMainLoop;
     RunModeSince = now;
+    FanCountdownLastSec = -1;
+  } else {
+    remain = RUN_FAN_DURATION_MS - elapsed;
+    if (elapsed < RUN_FAN_FADE_MS) {
+      RunSound_Countdown(remain, "fade-in");
+    } else if (elapsed >= (RUN_FAN_DURATION_MS - RUN_FAN_FADE_MS)) {
+      RunSound_Countdown(remain, "fade-out");
+    } else {
+      RunSound_Countdown(remain, "play");
+    }
   }
 }
 
@@ -1467,6 +2080,10 @@ int main(void)
 	_SetVolume();
 	//LoopOn(0, PHRASE_RUN_LOOP);
 #endif
+#ifdef SOUND_TEST_MENU
+   printf("SOUND_TEST_MENU: press 1/2/3/4/0 to test, 'n' for normal\n");
+   SoundTest_PrintMenu();
+#endif
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -1478,76 +2095,241 @@ int main(void)
 	  //TailLampの処理==============================================
 	  SetTailLED(IsNormalDir);
 
-	  //ADCの取得（尾灯方向用 OFF 判定のため 10ms 周期）===============
+	  //ADCの取得（尾灯方向用 OFF 判定のため 5ms 周期）===============
 	    if (Elapsed(adc_tick) >= POWER_ADC_PERIOD_MS)
 	    {
 	        adc_tick += POWER_ADC_PERIOD_MS;
 
-	        int val = AdcRead();
+int val = AdcRead();
 	        if(val>=0){
-	        	uint16_t off_ms;
 	        	uint8_t became_armed;
-	        	int vm_now;
+	        	uint8_t off_like;
 	        	PowerMV=GetPower_mV(val);
-	        	if (PowerMV < DIR_POWER_OFF_MV) {
-	        		DirPowerOk = 0U;
-	        		DirRecoverMs = 0;
-	        		if (DirPowerOffMs < 0xFFFFu) {
-	        			DirPowerOffMs = (uint16_t)(DirPowerOffMs + POWER_ADC_PERIOD_MS);
-	        		}
-	        		became_armed = 0U;
-	        		if (DirPowerOffMs >= DIR_POWER_OFF_MS) {
-	        			if (DirRelatchArmed == 0U) {
-	        				became_armed = 1U;
-	        			}
-	        			DirRelatchArmed = 1U;
-	        		}
-	        		DirPowerWasOff = 1U;
-	        		if (became_armed != 0U) {
-	        			printf("DIR_ARM off=%ums Power=%dmV\n",
-	        			       (unsigned)DirPowerOffMs, PowerMV);
-	        		}
-	        	} else {
-	        		DirPowerOk = 1U;
-	        		if (DirPowerWasOff != 0U) {
-	        			off_ms = DirPowerOffMs;
-	        			printf("DIR_OFF %ums (th=%dms/%dmV) Power=%dmV armed=%u dir=%d\n",
-	        			       (unsigned)off_ms,
-	        			       (int)DIR_POWER_OFF_MS,
-	        			       (int)DIR_POWER_OFF_MV,
-	        			       PowerMV,
-	        			       (unsigned)DirRelatchArmed,
-	        			       IsNormalDir);
-	        			DirPowerWasOff = 0U;
-	        			DirRecoverMs = 0; /* 復帰デバウンス開始 */
-	        		}
-	        		DirPowerOffMs = 0;
 
-	        		/* armed 中は復帰後 DIR_RECOVER_MS 安定してから VM で確定 */
-	        		if (DirRelatchArmed != 0U) {
-	        			if (DirRecoverMs < 0xFFFFu) {
-	        				DirRecoverMs = (uint16_t)(DirRecoverMs + POWER_ADC_PERIOD_MS);
-	        			}
-	        			if (DirRecoverMs >= DIR_RECOVER_MS) {
-	        				vm_now = digitalRead_VM();
-	        				IsNormalDir = (vm_now != 0);
-	        				DirRelatchArmed = 0U;
-	        				DirRecoverMs = 0;
-	        				DirLastVM = (uint8_t)vm_now;
-	        				DirHoldMs = 0;
-	        				printf("DIR_LATCH %s vm=%d Power=%dmV\n",
-	        				       IsNormalDir ? "FWD" : "REV",
-	        				       vm_now, PowerMV);
-	        			}
-	        		} else {
-	        			DirRecoverMs = 0;
+	        	if ((int)DirPowerPeakMv < PowerMV) {
+	        		DirPowerPeakMv = (uint16_t)PowerMV;
+	        	}
+
+	        	off_like = 0U;
+	        	if (PowerMV < DIR_POWER_OFF_MV) {
+	        		off_like = 1U;
+	        	} else if (DirPowerPeakMv > 0U &&
+	        		   DirPowerPeakMv <= (uint16_t)DIR_DROP_ARM_MAX_PEAK) {
+	        		/* DROP武装は低電圧peak時のみ。
+	        		 * 高電圧からスロットルを下げただけでは武装しない。 */
+	        		uint16_t drop_need = (uint16_t)DIR_DROP_ARM_MV;
+	        		uint16_t drop_pct = (uint16_t)(((uint32_t)DirPowerPeakMv * (uint32_t)DIR_DROP_ARM_PCT) / 100U);
+	        		if (drop_pct > drop_need) {
+	        			drop_need = drop_pct;
+	        		}
+	        		if ((uint16_t)PowerMV + drop_need <= DirPowerPeakMv) {
+	        			off_like = 1U;
 	        		}
 	        	}
-	        	if (LastLoggedDir != IsNormalDir) {
-	        		LastLoggedDir = IsNormalDir;
-	        		printf("DIR_NOW %s Power=%dmV\n",
-	        		       IsNormalDir ? "FWD" : "REV",
-	        		       PowerMV);
+
+	        	/* 走行中はpeakを現在値へ追従（スロットル下げ後に古い高peakが残らない） */
+	        	if (off_like == 0U && DirRelatchArmed == 0U && DirVmPowerGood != 0U) {
+	        		DirPowerPeakMv = (uint16_t)PowerMV;
+	        	}
+
+	        	DirMeas_Update(off_like);
+
+	        	/* VM trust hysteresis: set at ON_MV, clear only below OFF_MV. */
+	        	if (PowerMV >= DIR_POWER_ON_MV) {
+	        		if (DirVmPowerGood == 0U) {
+	        			DirVmPowerGood = 1U;
+	        			DirRecoverMs = 0;
+	        			DirVmCand = 0xFFu;
+	        			DirVmStableMs = 0;
+#ifdef DIR_DEBUG
+	        			printf("DIR power-good Power=%dmV\n", PowerMV);
+#endif
+	        		}
+	        		DirHadSolidOn = 1U;
+	        		/* Become ready as soon as solid ON (unless post-change locked) */
+	        		if (DirPostChangeLock == 0U && DirRelatchArmed == 0U) {
+#ifdef DIR_DEBUG
+	        			if (DirAllowArm == 0U) {
+	        				printf("DIR ready (solid ON) Power=%dmV\n", PowerMV);
+	        			}
+#endif
+	        			DirAllowArm = 1U;
+	        		}
+	        	} else if (PowerMV < DIR_POWER_OFF_MV) {
+	        		if (DirVmPowerGood != 0U) {
+	        			DirVmPowerGood = 0U;
+	        			DirRecoverMs = 0;
+	        			DirVmCand = 0xFFu;
+	        			DirVmStableMs = 0;
+	        		}
+	        		/* Release post-change lock on deep OFF so next gap can arm.
+	        		 * Do NOT set AllowArm here — that falsely armed on boot/power-up. */
+	        		DirPostChangeLock = 0U;
+	        		DirOnSettleMs = 0;
+	        		/* Next solid ON: absolute DIR from VM (PowerON判定) */
+	        		DirInitPending = 1U;
+	        		DirInitCand = 0xFFu;
+	        		DirInitStableMs = 0;
+	        	}
+
+	        	/* PowerON: VM安定後に絶対方向を確定（VM=1→反転, VM=0→正転） */
+	        	if (DirInitPending != 0U && DirVmPowerGood != 0U) {
+	        		uint8_t vm_u8 = (uint8_t)(digitalRead_VM() ? 1U : 0U);
+	        		if (DirInitCand != vm_u8) {
+	        			DirInitCand = vm_u8;
+	        			DirInitStableMs = 0;
+	        		} else if (DirInitStableMs < 0xFFFFu) {
+	        			DirInitStableMs = (uint16_t)(DirInitStableMs + POWER_ADC_PERIOD_MS);
+	        		}
+	        		if (DirInitStableMs >= DIR_VM_CHANGE_MS) {
+	        			int prev = IsNormalDir ? 1 : 0;
+	        			int neu = DirFromVm((int)vm_u8);
+	        			DirCommitDir(prev, neu, "power-ON-VM");
+	        			DirRelatchArmed = 0U;
+	        		}
+	        	} else if (DirVmPowerGood != 0U && DirPostChangeLock == 0U &&
+	        	           !CmdMode && !IsWhistle) {
+	        		/* 手動反転など電源ギャップ無し: VMが長く安定したらDIRを合わせる。
+	        		 * Quantum受信中(CmdMode)・汽笛中のみ抑制。
+	        		 * CmdFrameArmed（待受）では止めない — 待受中は常時trueになり追従不能になる。 */
+	        		uint8_t vm_u8 = (uint8_t)(digitalRead_VM() ? 1U : 0U);
+	        		int cur = IsNormalDir ? 1 : 0;
+	        		int neu = DirFromVm((int)vm_u8);
+	        		if (DirFollowCand != vm_u8) {
+	        			DirFollowCand = vm_u8;
+	        			DirFollowStableMs = 0;
+	        		} else if (DirFollowStableMs < 0xFFFFu) {
+	        			DirFollowStableMs = (uint16_t)(DirFollowStableMs + POWER_ADC_PERIOD_MS);
+	        		}
+	        		if (neu != cur && DirFollowStableMs >= DIR_VM_FOLLOW_MS) {
+	        			DirCommitDir(cur, neu, "VM-follow");
+	        			DirRelatchArmed = 0U;
+	        			DirFollowCand = 0xFFu;
+	        			DirFollowStableMs = 0;
+	        		}
+	        	} else {
+	        		DirFollowCand = 0xFFu;
+	        		DirFollowStableMs = 0;
+	        	}
+
+	        	DirVmWatch_Update();
+
+#ifdef POWER_VOLT_LOG
+	        	{
+	        		uint32_t now = HAL_GetTick();
+	        		if ((now - PowerVoltLogMs) >= 1000U) {
+	        			PowerVoltLogMs = now;
+	        			printf("Vin=%dmV VM=%d Dir=%s state=%d (ON>=%d OFF<=%d)\n",
+	        			       PowerMV,
+	        			       digitalRead_VM() ? 1 : 0,
+	        			       IsNormalDir ? "FWD" : "REV",
+	        			       PowerState, POWER_ON_TH, POWER_OFF_TH);
+	        		}
+	        	}
+#endif
+
+#ifdef DIR_DEBUG
+	        	/* Periodic power so "power ON but no ready" is diagnosable */
+	        	{
+	        		uint32_t now = HAL_GetTick();
+	        		if ((now - DirPowerLogMs) >= 1000U) {
+	        			DirPowerLogMs = now;
+	        			printf("Power=%dmV good=%u allow=%u\n",
+	        			       PowerMV,
+	        			       (unsigned)DirVmPowerGood,
+	        			       (unsigned)DirAllowArm);
+	        			if (DirVmPowerGood == 0U && DirWaitLogged == 0U) {
+	        				DirWaitLogged = 1U;
+	        				printf("DIR wait: need Power>=%dmV for ready\n",
+	        				       DIR_POWER_ON_MV);
+	        			}
+	        		}
+	        		if (DirVmPowerGood != 0U) {
+	        			DirWaitLogged = 0U;
+	        		}
+	        	}
+#endif
+
+	        	/* After CHANGE: wait for continuous solid ON before next arm. */
+	        	if (DirPostChangeLock != 0U) {
+	        		DirRelatchArmed = 0U;
+	        		DirAllowArm = 0U;
+	        		if (DirVmPowerGood != 0U) {
+	        			if (DirOnSettleMs < 0xFFFFu) {
+	        				DirOnSettleMs = (uint16_t)(DirOnSettleMs + POWER_ADC_PERIOD_MS);
+	        			}
+	        			if (DirOnSettleMs >= DIR_ON_SETTLE_MS) {
+	        				DirPostChangeLock = 0U;
+	        				DirAllowArm = 1U;
+	        				DirOnSettleMs = 0;
+	        				if ((int)DirPowerPeakMv < PowerMV) {
+	        					DirPowerPeakMv = (uint16_t)PowerMV;
+	        				}
+	        				DirArmLogged = 0U;
+	        			}
+	        		} else {
+	        			DirOnSettleMs = 0;
+	        		}
+	        	}
+
+	        	if (off_like != 0U) {
+	        		DirPowerOk = 0U;
+	        		became_armed = 0U;
+	        		if (DirVmPowerGood == 0U) {
+	        			DirRecoverMs = 0;
+	        			DirVmCand = 0xFFu;
+	        			DirVmStableMs = 0;
+	        		}
+	        		if (DirAllowArm != 0U && DirPostChangeLock == 0U && DirHadSolidOn != 0U) {
+	        			if (DirPowerOffMs < 0xFFFFu) {
+	        				DirPowerOffMs = (uint16_t)(DirPowerOffMs + POWER_ADC_PERIOD_MS);
+	        			}
+	        			if (DirPowerOffMs >= DIR_POWER_OFF_MS) {
+	        				if (DirRelatchArmed == 0U) {
+	        					became_armed = 1U;
+	        				}
+	        				DirRelatchArmed = 1U;
+	        			}
+	        		} else {
+	        			DirPowerOffMs = 0;
+	        			DirRelatchArmed = 0U;
+	        		}
+	        		DirPowerWasOff = 1U;
+	        		if (became_armed != 0U && DirArmLogged == 0U) {
+	        			DirArmLogged = 1U;
+#ifdef DIR_DEBUG
+	        			printf("DIR arm Power=%dmV peak=%umV\n",
+	        			       PowerMV, (unsigned)DirPowerPeakMv);
+#endif
+	        			/* Decide on recover (absolute VM), not here */
+	        		}
+	        		if (DirRelatchArmed != 0U && DirVmPowerGood != 0U) {
+	        			DirTryLatchWhileArmed();
+	        		}
+	        	} else if (DirVmPowerGood != 0U) {
+	        		DirPowerOk = 1U;
+	        		if (DirPowerWasOff != 0U) {
+	        			DirPowerWasOff = 0U;
+	        		}
+	        		DirPowerOffMs = 0;
+	        		if (DirRelatchArmed != 0U) {
+	        			DirTryLatchWhileArmed();
+	        		} else if (DirPostChangeLock == 0U) {
+#ifdef DIR_DEBUG
+	        			if (DirAllowArm == 0U) {
+	        				printf("DIR ready (solid ON) Power=%dmV\n", PowerMV);
+	        			}
+#endif
+	        			DirArmLogged = 0U;
+	        			DirAllowArm = 1U;
+	        			DirHadSolidOn = 1U;
+	        			if ((int)DirPowerPeakMv < PowerMV) {
+	        				DirPowerPeakMv = (uint16_t)PowerMV;
+	        			}
+	        		}
+	        	} else {
+	        		DirPowerWasOff = 1U;
+	        		DirPowerOffMs = 0;
 	        	}
 #ifdef POWER_CHECK_MODE
 	        	printf("Power=%dmV armed=%u ok=%u\n",
@@ -1555,12 +2337,73 @@ int main(void)
 #endif
 	        }
 	    }
-    	/* 電源連動: 起動音=フェーズ2、走行音=フェーズ1、ラジエター=フェーズ0 */
+#ifdef SOUND_TEST_MENU
+    	if (SoundTestActive != 0U) {
+    		/* 音源確認メニュー */
+    		SoundTest_Task();
+    	} else {
+    		char c;
+    		/* 通常動作中: 't' でテストメニューへ戻る */
+    		if (Uart1_TryGetChar(&c) != 0) {
+    			if (c == 't' || c == 'T') {
+    				SoundTest_EnterTest();
+    			}
+    		}
+    		if (SoundTestActive == 0U) {
+    			/* 電源連動: 起動音=P2(CH0)、走行=P1ループ(CH0)、ラジエター=P0重ね(CH1) */
+    			switch(PowerState){
+    			case powerIdle:
+    				if(PowerMV>=POWER_ON_TH){
+    					SoundDbg_Play(PHRASE_STARTUP);
+    					StdPlayOn(0, PHRASE_STARTUP);
+    					PowerState=powerStart;
+    				}
+    				break;
+    			case powerStart:
+    				if(!IsPlaying(0)){
+    					SoundDbg_Stop("startup end");
+    					RunSound_StartMainLoop();
+    					PowerState=powerON;
+    				}
+    				if(PowerMV<=POWER_OFF_TH){
+    					SoundDbg_Stop("power off");
+    					StopAll();
+    					RunSound_Reset();
+    					PowerState=powerStop;
+    				}
+    				break;
+    			case powerON:
+    				RunSound_Task();
+    				if(PowerMV<=POWER_OFF_TH){
+    					SoundDbg_Stop("power off");
+    					StopAll();
+    					RunSound_Reset();
+    					PowerState=powerStop;
+    				}
+    				break;
+    			case powerStop:
+    				if(!IsPlaying(0)){
+    					SoundDbg_Stop("idle");
+    					PowerState=powerIdle;
+    				}
+    				if(PowerMV>=POWER_ON_TH){
+    					SoundDbg_Stop("re-power");
+    					StopAll();
+    					RunSound_Reset();
+    					SoundDbg_Play(PHRASE_STARTUP);
+    					StdPlayOn(0, PHRASE_STARTUP);
+    					PowerState=powerStart;
+    				}
+    				break;
+    			}
+    		}
+    	}
+#else
+    	/* 電源連動: 起動音=P2(CH0)、走行=P1ループ(CH0)、ラジエター=P0重ね(CH1) */
     	switch(PowerState){
     	case powerIdle:
     		if(PowerMV>=POWER_ON_TH){
-    			SoundDbg_Play(PHRASE_STARTUP);
-    			StdPlayOn(0, PHRASE_STARTUP);
+    			SoundPowerOn_Start();
     			PowerState=powerStart;
     		}
     		break;
@@ -1594,14 +2437,13 @@ int main(void)
     	    }
     		if(PowerMV>=POWER_ON_TH){
     			SoundDbg_Stop("re-power");
-    			StopAll();
     			RunSound_Reset();
-    			SoundDbg_Play(PHRASE_STARTUP);
-    			StdPlayOn(0, PHRASE_STARTUP);
+    			SoundPowerOn_Start();
     			PowerState=powerStart;
     		}
     		break;
     	}
+#endif /* SOUND_TEST_MENU */
 #if 0
   	  if(LastPowerState!=PowerState){
   		  if((unsigned)PowerState <
