@@ -80,18 +80,23 @@ DMA_HandleTypeDef hdma_usart1_tx;
 #define DIR_POWER_OFF_MS         2U /* >=2ms below OFF_MV to arm */
 #define DIR_DROP_ARM_MV        600 /* low-V minimum peak-to-now drop to arm */
 #define DIR_DROP_ARM_PCT        40U /* low-V only: also require ~40% drop from peak */
-#define DIR_DROP_ARM_MAX_PEAK  4000 /* peakがこれ超ならDROP武装しない（スロットル下げ誤検出防止） */
+#define DIR_DROP_ARM_MAX_PEAK 15000 /* peak追従あり: 高電圧でも短ギャップ反転をDROPで取る */
 #define DIR_VM_CHANGE_MS        40U /* VM stable window (PowerON / armed latch) */
 /* 電源が落ちない手動反転: Quantum短パルスより長くVMが安定したらDIRを追従。
- * 汽笛/コマンド中は CmdMode/IsWhistle で抑制。 */
-#define DIR_VM_FOLLOW_MS       200U
+ * 汽笛はVMだけ反転しVinはほぼ一定 → Vin振れが無いときは追従しない。 */
+#define DIR_VM_FOLLOW_MS       500U /* > PW_WHISTLE(264): 汽笛検出が先 */
+#define DIR_QA_HOLD_MS         800U /* エッジ/汽笛/コマンド後の追従禁止 */
+#define DIR_FOLLOW_VIN_SWING_MV 500 /* 直近窓でこれ以上Vinが振れていないと追従しない */
+#define DIR_FOLLOW_VIN_WIN_MS  300U
+#define DIR_FOLLOW_VIN_KEEP_MS 2000U /* 振れ検出後、hold+followが終わるまで保持 */
 /* After power-good while armed:
  *  prev=FWD → wait VM=1 (REV). Do NOT force while VM still 0.
  *  prev=REV → take VM=0 early as FWD (late VM=1 is a lie on return). */
-#define DIR_FWD_FORCE_MS       200U /* was REV: force FWD if no VM=1 */
-#define DIR_REV_FORCE_MS       600U /* was FWD: wait longer for VM=0 */
-#define DIR_REV_FORCE_HARD_MS  900U /* last resort even if VM still 1 */
-#define DIR_ON_SETTLE_MS        50U
+#define DIR_FWD_FORCE_MS      1000U /* was REV: VM=0でもすぐFWDに戻さない */
+#define DIR_REV_FORCE_MS       600U /* was FWD: wait longer for VM=1 */
+#define DIR_REV_FORCE_HARD_MS  900U /* last resort even if VM still 0 */
+#define DIR_ON_SETTLE_MS       500U /* 方向確定後、再武装まで待つ */
+#define DIR_POST_HOLD_MS      1500U /* 確定後のVM追従禁止 */
 #define POWER_ADC_PERIOD_MS      1U /* 1ms: do not miss short power gap */
 
 /* 音源フェーズ (CH0) */
@@ -174,6 +179,12 @@ static uint8_t DirInitCand=0xFFu;
 static uint16_t DirInitStableMs=0;
 static uint8_t DirFollowCand=0xFFu;
 static uint16_t DirFollowStableMs=0;
+static volatile uint32_t DirQaHoldUntil=0; /* この時刻までVM追従禁止 */
+static uint16_t DirVinWinMax=0;
+static uint16_t DirVinWinMin=0xFFFFu;
+static uint16_t DirVinWinMs=0;
+static uint8_t DirVinSwingOk=0; /* 1: 直近に十分なVin振れあり */
+static uint32_t DirVinSwingUntil=0; /* この時刻まで振れOKを保持 */
 static uint8_t DirMeasEnable=0; /* 1: log power/VM edges with timestamps */
 static uint32_t DirMeasT0=0;
 static int8_t DirMeasLastPwr=-1; /* -1 unk, 0 off-like, 1 on */
@@ -187,6 +198,8 @@ static uint8_t DirWaitLogged=0;
 #endif
 #ifdef POWER_VOLT_LOG
 static uint32_t PowerVoltLogMs=0;
+static int DirLogLastVm=-1;
+static uint32_t DirLogVmTick=0;
 #endif
 static int LastLoggedDir=-1;
 
@@ -1018,6 +1031,8 @@ static void QA_1msTick(void)
 
   if (cState != LastState) {
     CmdFrameIdleMs = 0;
+    /* 極性エッジ直後はDIRのVM追従を禁止（汽笛・コマンド開始） */
+    DirQaHoldUntil = HAL_GetTick() + (uint32_t)DIR_QA_HOLD_MS;
     validBit = (PulseWidth >= PW_MIN) && (PulseWidth <= PW_LONG);
     validBell = (PulseWidth >= PW_BELL_MIN) && (PulseWidth <= PW_BELL_MAX);
 
@@ -1099,6 +1114,10 @@ static void QA_1msTick(void)
       if (CmdMode && (!IsWhistle)) {
         IsWhistle = true;
       }
+    }
+    /* 汽笛・コマンド中は追従禁止を延長 */
+    if (CmdMode || IsWhistle) {
+      DirQaHoldUntil = HAL_GetTick() + (uint32_t)DIR_QA_HOLD_MS;
     }
     LastState = cState;
   }
@@ -1231,6 +1250,16 @@ static void QA_Init(void)
   DirInitStableMs = 0;
   DirFollowCand = 0xFFu;
   DirFollowStableMs = 0;
+  DirQaHoldUntil = 0;
+  DirVinWinMax = 0;
+  DirVinWinMin = 0xFFFFu;
+  DirVinWinMs = 0;
+  DirVinSwingOk = 0U;
+  DirVinSwingUntil = 0;
+#ifdef POWER_VOLT_LOG
+  DirLogLastVm = -1;
+  DirLogVmTick = HAL_GetTick();
+#endif
   IsNormalDir = true; /* PowerONでVMから確定するまで仮の正転 */
   LastLoggedDir = IsNormalDir; /* 起動直後の偽 DIR_NOW を出さない */
   SetTailLED(IsNormalDir);
@@ -1858,6 +1887,10 @@ static void DirCommitDir(int prev_dir, int new_dir, const char *why)
   DirPostChangeLock = 1U;
   DirOnSettleMs = 0;
   DirInitPending = 0U;
+  DirVinSwingOk = 0U;
+  DirFollowCand = 0xFFu;
+  DirFollowStableMs = 0;
+  DirQaHoldUntil = HAL_GetTick() + (uint32_t)DIR_POST_HOLD_MS;
   if (PowerMV > 0) {
     DirPowerPeakMv = (uint16_t)PowerMV;
   }
@@ -1925,16 +1958,19 @@ static void DirTryLatchWhileArmed(void)
       }
     }
   } else {
-    /* Was REV: take VM=0 as FWD. Do NOT force FWD while VM stays 1. */
-    if (vm_u8 == 0U && DirVmStableMs >= DIR_VM_CHANGE_MS) {
+    /* Was REV: take stable VM=0 as FWD. Do NOT force FWD early —
+     * reverse recover often lies with VM=0 and wiped the taillight. */
+    if (vm_u8 == 0U && DirVmStableMs >= DIR_VM_CHANGE_MS &&
+        DirRecoverMs >= DIR_FWD_FORCE_MS) {
       DirCommitDir(prev_dir, 1, "VM-FWD");
       return;
     }
-    if (DirRecoverMs >= DIR_FWD_FORCE_MS && vm_u8 == 0U) {
+    if (DirRecoverMs >= (DIR_FWD_FORCE_MS + 500U) && vm_u8 == 0U &&
+        DirVmStableMs >= DIR_VM_CHANGE_MS) {
       DirCommitDir(prev_dir, 1, "force-FWD");
       return;
     }
-    if (DirRecoverMs >= DIR_FWD_FORCE_MS &&
+    if (DirRecoverMs >= (DIR_FWD_FORCE_MS + 500U) &&
         vm_u8 != 0U && DirVmStableMs >= DIR_VM_CHANGE_MS) {
       /* Confirmed still REV after gap — drop arm, keep taillight ON */
       DirRelatchArmed = 0U;
@@ -2187,23 +2223,61 @@ int val = AdcRead();
 	        			DirCommitDir(prev, neu, "power-ON-VM");
 	        			DirRelatchArmed = 0U;
 	        		}
-	        	} else if (DirVmPowerGood != 0U && DirPostChangeLock == 0U &&
-	        	           !CmdMode && !IsWhistle) {
-	        		/* 手動反転など電源ギャップ無し: VMが長く安定したらDIRを合わせる。
-	        		 * Quantum受信中(CmdMode)・汽笛中のみ抑制。
-	        		 * CmdFrameArmed（待受）では止めない — 待受中は常時trueになり追従不能になる。 */
-	        		uint8_t vm_u8 = (uint8_t)(digitalRead_VM() ? 1U : 0U);
-	        		int cur = IsNormalDir ? 1 : 0;
-	        		int neu = DirFromVm((int)vm_u8);
-	        		if (DirFollowCand != vm_u8) {
-	        			DirFollowCand = vm_u8;
-	        			DirFollowStableMs = 0;
-	        		} else if (DirFollowStableMs < 0xFFFFu) {
-	        			DirFollowStableMs = (uint16_t)(DirFollowStableMs + POWER_ADC_PERIOD_MS);
+	        	} else if (DirVmPowerGood != 0U && DirPostChangeLock == 0U) {
+	        		uint32_t now = HAL_GetTick();
+	        		/* Vin振れ監視: 汽笛はVMのみ変化、実反転は電源にも振れが出やすい */
+	        		if (DirVinWinMs == 0U) {
+	        			DirVinWinMax = (uint16_t)PowerMV;
+	        			DirVinWinMin = (uint16_t)PowerMV;
+	        		} else {
+	        			if ((int)DirVinWinMax < PowerMV) {
+	        				DirVinWinMax = (uint16_t)PowerMV;
+	        			}
+	        			if ((int)DirVinWinMin > PowerMV) {
+	        				DirVinWinMin = (uint16_t)PowerMV;
+	        			}
 	        		}
-	        		if (neu != cur && DirFollowStableMs >= DIR_VM_FOLLOW_MS) {
-	        			DirCommitDir(cur, neu, "VM-follow");
-	        			DirRelatchArmed = 0U;
+	        		if (DirVinWinMs < 0xFFFFu) {
+	        			DirVinWinMs = (uint16_t)(DirVinWinMs + POWER_ADC_PERIOD_MS);
+	        		}
+	        		/* 振れは検出したら hold(800)+follow(500) より長く保持する。
+	        		 * 静かな 300ms 窓で落とすと、切替時の一瞬の落ち込みを逃す。 */
+	        		if (DirVinWinMax >= DirVinWinMin &&
+	        		    (uint16_t)(DirVinWinMax - DirVinWinMin) >= (uint16_t)DIR_FOLLOW_VIN_SWING_MV) {
+	        			DirVinSwingOk = 1U;
+	        			DirVinSwingUntil = now + (uint32_t)DIR_FOLLOW_VIN_KEEP_MS;
+	        		}
+	        		if (DirVinWinMs >= DIR_FOLLOW_VIN_WIN_MS) {
+	        			DirVinWinMs = 0;
+	        		}
+	        		if (DirVinSwingOk != 0U &&
+	        		    (int32_t)(now - DirVinSwingUntil) >= 0) {
+	        			DirVinSwingOk = 0U;
+	        		}
+
+	        		if (CmdMode || IsWhistle ||
+	        		    ((int32_t)(now - DirQaHoldUntil) < 0)) {
+	        			DirFollowCand = 0xFFu;
+	        			DirFollowStableMs = 0;
+	        		} else if (DirVinSwingOk != 0U) {
+	        			/* 手動反転など: Vin振れあり + VM安定でDIR追従。汽笛は振れ無しで除外。 */
+	        			uint8_t vm_u8 = (uint8_t)(digitalRead_VM() ? 1U : 0U);
+	        			int cur = IsNormalDir ? 1 : 0;
+	        			int neu = DirFromVm((int)vm_u8);
+	        			if (DirFollowCand != vm_u8) {
+	        				DirFollowCand = vm_u8;
+	        				DirFollowStableMs = 0;
+	        			} else if (DirFollowStableMs < 0xFFFFu) {
+	        				DirFollowStableMs = (uint16_t)(DirFollowStableMs + POWER_ADC_PERIOD_MS);
+	        			}
+	        			if (neu != cur && DirFollowStableMs >= DIR_VM_FOLLOW_MS) {
+	        				DirCommitDir(cur, neu, "VM-follow");
+	        				DirRelatchArmed = 0U;
+	        				DirFollowCand = 0xFFu;
+	        				DirFollowStableMs = 0;
+	        				DirVinSwingOk = 0U;
+	        			}
+	        		} else {
 	        			DirFollowCand = 0xFFu;
 	        			DirFollowStableMs = 0;
 	        		}
@@ -2217,13 +2291,56 @@ int val = AdcRead();
 #ifdef POWER_VOLT_LOG
 	        	{
 	        		uint32_t now = HAL_GetTick();
+	        		int vm_now = digitalRead_VM() ? 1 : 0;
+	        		int want = DirFromVm(vm_now);
+	        		uint16_t swing = 0;
+	        		int32_t hold = (int32_t)(DirQaHoldUntil - now);
+	        		const char *blk;
+	        		if (DirVinWinMax >= DirVinWinMin) {
+	        			swing = (uint16_t)(DirVinWinMax - DirVinWinMin);
+	        		}
+	        		if (hold < 0) {
+	        			hold = 0;
+	        		}
+	        		if (CmdMode || IsWhistle) {
+	        			blk = "whistle";
+	        		} else if (hold > 0) {
+	        			blk = "hold";
+	        		} else if (DirVinSwingOk == 0U) {
+	        			blk = "vin";
+	        		} else if (want == (IsNormalDir ? 1 : 0)) {
+	        			blk = "same";
+	        		} else if (DirFollowStableMs < DIR_VM_FOLLOW_MS) {
+	        			blk = "wait";
+	        		} else {
+	        			blk = "ok";
+	        		}
+	        		if (DirLogLastVm < 0) {
+	        			DirLogLastVm = vm_now;
+	        			DirLogVmTick = now;
+	        		} else if (vm_now != DirLogLastVm) {
+	        			printf("VM %d->%d DT=%lums Vin=%dmV swing=%umV/%d Dir=%s want=%s blk=%s\n",
+	        			       DirLogLastVm, vm_now,
+	        			       (unsigned long)(now - DirLogVmTick),
+	        			       PowerMV, (unsigned)swing, DIR_FOLLOW_VIN_SWING_MV,
+	        			       IsNormalDir ? "FWD" : "REV",
+	        			       want ? "FWD" : "REV",
+	        			       blk);
+	        			DirLogLastVm = vm_now;
+	        			DirLogVmTick = now;
+	        		}
 	        		if ((now - PowerVoltLogMs) >= 1000U) {
 	        			PowerVoltLogMs = now;
-	        			printf("Vin=%dmV VM=%d Dir=%s state=%d (ON>=%d OFF<=%d)\n",
+	        			printf("Vin=%dmV VM=%d Dir=%s want=%s state=%d DT=%lums swing=%umV/%d blk=%s (ON>=%d OFF<=%d)\n",
 	        			       PowerMV,
-	        			       digitalRead_VM() ? 1 : 0,
+	        			       vm_now,
 	        			       IsNormalDir ? "FWD" : "REV",
-	        			       PowerState, POWER_ON_TH, POWER_OFF_TH);
+	        			       want ? "FWD" : "REV",
+	        			       PowerState,
+	        			       (unsigned long)(now - DirLogVmTick),
+	        			       (unsigned)swing, DIR_FOLLOW_VIN_SWING_MV,
+	        			       blk,
+	        			       POWER_ON_TH, POWER_OFF_TH);
 	        		}
 	        	}
 #endif
